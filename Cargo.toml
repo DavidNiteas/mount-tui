@@ -2,6 +2,14 @@
 name = "mount-tui"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.74"
+description = "Terminal disk and USB manager with a TUI and scriptable CLI"
+authors = ["David Niteas"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DavidNiteas/mount-tui"
+readme = "README.md"
+keywords = ["tui", "disk", "usb", "mount", "cli"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 ratatui = "0.29"
