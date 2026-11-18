@@ -1,131 +1,148 @@
 # Mount-TUI
 
-终端里的磁盘与 USB 管理器：查看块设备树，挂载 / 卸载可移动介质，并提供脚本化的
-非交互 CLI。
+**English** | [简体中文](README.zh-CN.md)
 
-TUI 左侧是设备树（含分区、LVM、crypt 子节点），右侧是选中设备的详情（型号、
-传输方式、文件系统、卷标、UUID、挂载点、是否受保护），底部是状态栏与键位提示。
+A terminal disk and USB manager for Linux: browse block devices, mount and unmount
+removable media, and script the same operations through a non-interactive CLI.
 
-## 功能
+The TUI shows a device tree on the left (including partitions, LVM and crypt
+children) and details for the selected device on the right (model, transport,
+filesystem, label, UUID, mount points and protection status). The status bar and
+key hints sit at the bottom.
 
-- 设备树、分区 / LVM / crypt 子节点、USB / 可移动 / 只读 / 卷标标记；
-- 挂载、卸载、强制卸载（二次确认）；
-- 系统盘保护：`/`、`/boot`、`/home`、`/home/<user>` 及系统前缀不会被卸载；
-- 多挂载点保护：同一设备多个挂载点时拒绝自动卸载；
-- 自动刷新：插拔设备后自动更新列表，保留选中与折叠状态；
-- 搜索、隐藏 loop 设备、详情滚动、小终端自适应布局；
-- 两种挂载后端：默认非 root 的 `udisksctl`，或显式启用的 `sudo` + 自定义挂载根；
-- 非交互 CLI：`list`、`status`、`mount`、`unmount`、`force-unmount`，支持 JSON。
+## Features
 
-## 依赖
+- Device tree with partitions, LVM/crypt children, USB/removable/read-only/label
+  tags;
+- Mount, unmount and forced unmount (with confirmation);
+- System-disk protection: `/`, `/boot`, `/home`, `/home/<user>` and system
+  prefixes are never unmounted;
+- Multi-mount protection: a device with several mount points is refused;
+- Automatic refresh: hotplugged devices appear without a keypress, preserving
+  selection and collapse state;
+- Search, loop-device filtering, scrollable details and a compact layout for
+  short terminals;
+- Two mount backends: unprivileged `udisksctl` by default, or opt-in `sudo` with
+  a configurable mount root;
+- Non-interactive CLI: `list`, `status`, `mount`, `unmount`, `force-unmount`,
+  with JSON output.
 
-- Linux；
-- `lsblk`（util-linux）；
-- 默认模式需要 `udisksctl`（udisks2）；`sudo` 模式需要可用的 `sudo`；
-- `fuser` / `lsof` 可选：卸载时用于列出占用进程。
+## Requirements
 
-## 安装
+- Linux;
+- `lsblk` from util-linux;
+- `udisksctl` (udisks2) for the default mode; `sudo` for the opt-in sudo mode;
+- Optional `fuser` / `lsof`: used to list processes when an unmount is busy.
+
+## Installation
 
 ```bash
 cargo install --path .
 ```
 
-也可以直接构建：
+Or build directly:
 
 ```bash
 cargo build --release
 ./target/release/mount-tui
 ```
 
-## 运行
+## Usage
 
 ```bash
 mount-tui
 ```
 
-默认进入 TUI。命令行用法见下方「CLI」。
+The default command opens the TUI. See [CLI](#cli) for non-interactive commands.
 
-## 两种挂载模式
+## Mount modes
 
-| 模式 | 是否需要 root | 挂载点 | 默认 |
+| Mode | Root required | Mount point | Default |
 |---|---|---|---|
-| `udisksctl` | 否 | 由 udisks2 决定（通常 `/media/<user>/<label>`） | 是 |
-| `sudo` | 是 | 可配置挂载根下（默认 `~/mnt/usb`） | 否，显式开启 |
+| `udisksctl` | No | Chosen by udisks2 (usually `/media/<user>/<label>`) | Yes |
+| `sudo` | Yes | Under a configurable mount root (default `~/mnt/usb`) | No, opt-in |
 
-默认模式不会调用 sudo，也不会创建挂载点目录。需要把设备固定挂到自己的目录时，
-显式启用 sudo 模式。
+The default mode never calls sudo and never creates mount-point directories.
+Enable sudo mode when you need devices mounted at a fixed location.
 
-## 配置
+## Configuration
 
-配置文件：
+Configuration file:
 
 ```text
 $XDG_CONFIG_HOME/mount-tui/config.toml
-# 未设置 XDG_CONFIG_HOME 时：
+# or, when XDG_CONFIG_HOME is unset:
 $HOME/.config/mount-tui/config.toml
 ```
 
 ```toml
 [mount]
-mode = "udisksctl"   # 或 "sudo"
-root = "~/mnt/usb"   # 仅 sudo 模式使用
+mode = "udisksctl"   # or "sudo"
+root = "~/mnt/usb"   # sudo mode only
 ```
 
-优先级：`--mount-mode` / `--mount-root` > 环境变量 `MOUNT_TUI_MODE` /
-`MOUNT_TUI_MOUNT_ROOT` > 配置文件 > 默认值。
+Precedence: `--mount-mode` / `--mount-root` > environment variables
+`MOUNT_TUI_MODE` / `MOUNT_TUI_MOUNT_ROOT` > config file > defaults.
 
-`root` 支持 `~` / `~/...` 与绝对路径；系统目录（`/`、`/boot`、`/home`、`/mnt`、
-`/media`、`/tmp` 等）和 `$HOME` 本身会被拒绝。`sudo` 模式的挂载点优先使用卷标，
-无卷标时使用设备名；冲突自动加后缀，符号链接目标会被拒绝。FAT/exFAT/NTFS 会自动
-补充 `uid`/`gid`/`umask`，保证普通用户可写。
+`root` supports `~`, `~/...` and absolute paths. System directories (`/`,
+`/boot`, `/home`, `/mnt`, `/media`, `/tmp`, etc.) and `$HOME` itself are refused.
+In sudo mode, mount points use the filesystem label first, then the device name;
+collisions get a suffix and symbolic-link targets are refused. FAT/exFAT/NTFS
+filesystems automatically receive `uid`/`gid`/`umask` so they remain writable for
+the invoking user.
 
-## 键位
+## Key bindings
 
-| 按键 | 作用 |
+| Key | Action |
 |---|---|
-| `Up` / `Down` | 上下移动选择 |
-| `PgUp` / `PgDn` | 翻页 |
-| `Home` / `End` | 跳到首 / 尾 |
-| `Left` / `Right` | 折叠 / 展开当前节点 |
-| `Enter` | 未挂载则挂载，已挂载则卸载 |
-| `m` | 挂载选中设备 |
-| `u` | 卸载选中设备 |
-| `f` | 强制卸载：第一次提示，第二次确认后执行 |
-| `r` | 立即刷新设备列表 |
-| `/` | 搜索（name / label / model / fstype / 挂载点） |
-| `l` | 显示 / 隐藏 loop 设备 |
-| `[` / `]` | 详情上 / 下滚动 |
-| `q` / `Esc` / `Ctrl-C` | 退出（有搜索过滤时 `Esc` 先清过滤） |
+| `Up` / `Down` | Move selection |
+| `PgUp` / `PgDn` | Page up / down |
+| `Home` / `End` | Jump to first / last device |
+| `Left` / `Right` | Collapse / expand the selected node |
+| `Enter` | Mount if unmounted, unmount if mounted |
+| `m` | Mount the selected device |
+| `u` | Unmount the selected device |
+| `f` | Force unmount: first press arms, second press confirms |
+| `r` | Refresh the device list now |
+| `/` | Search by name, label, model, fstype or mount point |
+| `l` | Show / hide loop devices |
+| `[` / `]` | Scroll details up / down |
+| `q` / `Esc` / `Ctrl-C` | Quit (`Esc` clears an active filter first) |
 
-搜索输入态下字符直接进入查询，`Enter` 保留过滤、`Esc` 取消；`q` 是普通字符。
+In the search input, characters go into the query; `Enter` keeps the filter and
+`Esc` cancels it. `q` is a normal character while searching.
 
-## 挂载与卸载
+## Mounting and unmounting
 
-| 动作 | `udisksctl` 模式 | `sudo` 模式 |
+| Action | `udisksctl` mode | `sudo` mode |
 |---|---|---|
-| 挂载 | `udisksctl mount -b /dev/X` | `sudo mount -o <options> /dev/X <root>/<label-or-name>` |
-| 卸载 | `udisksctl unmount -b /dev/X` | `sudo umount /dev/X` |
-| 强制卸载 | `udisksctl unmount -b /dev/X -f` | `sudo umount -l /dev/X` |
+| Mount | `udisksctl mount -b /dev/X` | `sudo mount -o <options> /dev/X <root>/<label-or-name>` |
+| Unmount | `udisksctl unmount -b /dev/X` | `sudo umount /dev/X` |
+| Force unmount | `udisksctl unmount -b /dev/X -f` | `sudo umount -l /dev/X` |
 
-sudo 模式的挂载点只在执行前创建；挂载失败或取消时，本次新建的空目录会被清理。
-`udisksctl` 模式失败时只报告错误，不会自动改用 sudo。
+In sudo mode the target directory is created only immediately before the mount;
+if the mount fails or is cancelled, the directory created by that attempt is
+removed when empty. In udisksctl mode failures are reported without silently
+switching to sudo.
 
-## 强制卸载
+## Forced unmount
 
-`f` 是破坏性操作：第一次按下只显示确认提示，同一设备再按一次才执行；移动选择、
-翻页、折叠、`m` / `u` / `Enter` 或 `r` 刷新都会取消确认。CLI 的
-`force-unmount` 需要显式 `--yes`。
+`f` is destructive: the first press only shows a confirmation, and a second press
+on the same device executes it. Moving the selection, paging, collapsing,
+`m` / `u` / `Enter` or `r` cancels the confirmation. The CLI
+`force-unmount` requires an explicit `--yes`.
 
-## 系统盘保护
+## System mount protection
 
-卸载前会检查：
+Before unmounting:
 
-1. 设备必须已挂载；
-2. 设备的任意挂载点属于系统路径即拒绝：`/`、`/boot`、`/home`、`/home/<user>`、
-   `/usr`、`/var`、`/etc`、`/opt`、`/root`、`/srv`、`/tmp` 及对应前缀；
-3. 多挂载点设备只允许手动处理。
+1. The device must be mounted.
+2. Any mount point under a protected path refuses the operation: `/`, `/boot`,
+   `/home`, `/home/<user>`, `/usr`, `/var`, `/etc`, `/opt`, `/root`, `/srv`,
+   `/tmp` and their system prefixes.
+3. A device with multiple mount points must be handled manually.
 
-## CLI（非交互）
+## CLI
 
 ```text
 mount-tui list [--json]
@@ -135,9 +152,10 @@ mount-tui unmount <dev>
 mount-tui force-unmount <dev> --yes
 ```
 
-`<dev>` 支持设备名（`sdb1`）、路径（`/dev/sdb1`）或唯一卷标（大小写不敏感）。
+`<dev>` accepts a device name (`sdb1`), a path (`/dev/sdb1`) or a unique label
+(case-insensitive).
 
-示例：
+Examples:
 
 ```bash
 mount-tui list
@@ -148,25 +166,31 @@ mount-tui unmount sdb1
 mount-tui force-unmount sdb1 --yes
 ```
 
-退出码：`0` 成功，`1` 操作失败，`2` 用法或配置错误。`--json` 只用于
-`list` / `status`；JSON 字段只追加，不改名或删除。
+Exit codes: `0` success, `1` operation failure, `2` usage or configuration
+error. `--json` is available for `list` and `status`; JSON fields are append-only
+and are never renamed or removed.
 
-## 许可
+## License
 
-本项目采用 Rust 同款双许可，任选其一：
+Licensed under either of:
 
-- Apache License, Version 2.0（[`LICENSE-APACHE`](LICENSE-APACHE)）
-- MIT License（[`LICENSE-MIT`](LICENSE-MIT)）
+- Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE))
+- MIT License ([`LICENSE-MIT`](LICENSE-MIT))
 
-除非你明确声明，否则任何有意提交以纳入本项目的贡献，均按上述双许可授权，不附加
-其他条款或条件。
+at your option.
 
-## 使用限制
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
 
-- `udisksctl` 模式无法指定挂载点，挂载位置由 udisks2 决定；需要固定位置请使用
-  sudo 模式。
-- sudo 模式需要终端认证，不适合无人值守场景。
-- 不处理 LUKS 解锁、`fstab` 编辑或额外挂载选项。
-- 状态栏最多 8 行；超长消息可能被裁剪。
-- 终端高度不足 14 行时键位提示自动隐藏。
-- 命令执行期间界面可能短暂无响应；CLI 每次调用都会重新读取设备。
+## Limitations
+
+- In udisksctl mode the mount point cannot be chosen; it is decided by udisks2.
+  Use sudo mode for a fixed location.
+- Sudo mode requires interactive authentication and is not suitable for
+  unattended operation.
+- LUKS unlocking, `fstab` editing and extra mount options are not handled.
+- The status bar is capped at 8 rows; very long messages may be truncated.
+- Key hints are hidden when the terminal is shorter than 14 rows.
+- The UI may pause briefly while a command runs; the CLI re-reads devices on
+  every invocation.

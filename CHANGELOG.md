@@ -1,5 +1,7 @@
 # Changelog
 
+**English** | [简体中文](CHANGELOG.zh-CN.md)
+
 All notable user-facing changes are documented here.
 
 ## [0.1.0] - 2026-11-18
