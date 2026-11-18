@@ -22,7 +22,7 @@ cap sudo_prompt
 # The TUI must be suspended: mock sudo output and the retry prompt are visible.
 check "sudo ran on the normal screen" "MOCK SUDO" "$OUT/sudo_prompt.txt"
 check "failure keeps error visible" "Press Enter to return to Mount-TUI" "$OUT/sudo_prompt.txt"
-check "sudo mount invoked" "SUDO mount /dev/sdz1" "$STATE/calls.log"
+check "sudo mount invoked with safe options" "SUDO mount -o nosuid,nodev /dev/sdz1" "$STATE/calls.log"
 
 send Enter
 sleep 0.6

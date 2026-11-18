@@ -46,15 +46,13 @@ fn main() -> anyhow::Result<()> {
     let mut session = Session::new().context("Failed to initialise terminal")?;
     let result = run(&mut session, &mut app, &runner);
 
-    // Restore the terminal before the error (if any) is printed.
+    // Restore the terminal before the error (if any) is printed: the error is
+    // returned to the runtime, which prints it and exits non-zero. A runtime
+    // error must never be swallowed into a successful exit status.
     session.suspend()?;
     drop(session);
 
-    if let Err(error) = result {
-        eprintln!("Error: {}", error);
-    }
-
-    Ok(())
+    result
 }
 
 /// Owns the terminal and guarantees a restore on drop.

@@ -8,6 +8,14 @@ use crate::runner::{CommandRunner, CommandSpec};
 /// Number of rows jumped by PageUp / PageDown.
 const PAGE_STEP: usize = 10;
 
+/// Mount options added to the `sudo mount` fallback: a removable / untrusted
+/// filesystem must never expose setuid binaries or device nodes on the host.
+const SAFE_MOUNT_OPTIONS: &str = "nosuid,nodev";
+
+/// Prefix of the status line asking for the second `f` press. [`App::clear_force_confirm`]
+/// uses it to remove the prompt again when the pending confirmation is dropped.
+const FORCE_CONFIRM_PROMPT: &str = "Press f again to force-unmount";
+
 /// Represents a flattened view item in the TUI list
 #[derive(Debug, Clone)]
 pub struct DeviceItem {
@@ -56,6 +64,9 @@ pub struct App {
     pub collapsed: HashSet<String>,
     pub list_state: ListState,
     pub action: ActionStatus,
+    /// Device with an armed force-unmount confirmation: the first `f` arms it,
+    /// the second `f` on the same device actually runs the command.
+    pub force_confirm: Option<String>,
     pub running: bool,
 }
 
@@ -66,6 +77,7 @@ impl App {
             collapsed: HashSet::new(),
             list_state: ListState::default(),
             action: ActionStatus::None,
+            force_confirm: None,
             running: true,
         };
         app.clamp_selection();
@@ -126,6 +138,7 @@ impl App {
     }
 
     pub fn navigate_up(&mut self) {
+        self.clear_force_confirm();
         let index = self.list_state.selected().unwrap_or(0).saturating_sub(1);
         if !self.flat_items().is_empty() {
             self.list_state.select(Some(index));
@@ -133,6 +146,7 @@ impl App {
     }
 
     pub fn navigate_down(&mut self) {
+        self.clear_force_confirm();
         let len = self.flat_items().len();
         if len == 0 {
             return;
@@ -142,12 +156,14 @@ impl App {
     }
 
     pub fn select_first(&mut self) {
+        self.clear_force_confirm();
         if !self.flat_items().is_empty() {
             self.list_state.select(Some(0));
         }
     }
 
     pub fn select_last(&mut self) {
+        self.clear_force_confirm();
         let len = self.flat_items().len();
         if len > 0 {
             self.list_state.select(Some(len - 1));
@@ -155,6 +171,7 @@ impl App {
     }
 
     pub fn page_up(&mut self) {
+        self.clear_force_confirm();
         if self.flat_items().is_empty() {
             return;
         }
@@ -167,6 +184,7 @@ impl App {
     }
 
     pub fn page_down(&mut self) {
+        self.clear_force_confirm();
         let len = self.flat_items().len();
         if len == 0 {
             return;
@@ -177,6 +195,7 @@ impl App {
 
     /// Collapse / expand the selected node (any level that has children).
     pub fn toggle_collapse(&mut self) {
+        self.clear_force_confirm();
         let Some(item) = self.selected_item() else {
             return;
         };
@@ -215,6 +234,7 @@ impl App {
 
     /// Enter: mount when unmounted, unmount when mounted, explain otherwise.
     pub fn enter_selected(&mut self, runner: &dyn CommandRunner) -> Option<InteractiveRequest> {
+        self.clear_force_confirm();
         let Some(device) = self.selected_device() else {
             self.action = ActionStatus::Error("No device selected".into());
             return None;
@@ -237,6 +257,7 @@ impl App {
 
     /// Mount the selected device (udisksctl first, sudo mount as fallback).
     pub fn mount_selected(&mut self, runner: &dyn CommandRunner) -> Option<InteractiveRequest> {
+        self.clear_force_confirm();
         let Some(device) = self.selected_device() else {
             self.action = ActionStatus::Error("No device selected".into());
             return None;
@@ -305,7 +326,13 @@ impl App {
         }
         Some(InteractiveRequest {
             program: "sudo".into(),
-            args: vec!["mount".into(), disk::device_path(&device.name), mount_point],
+            args: vec![
+                "mount".into(),
+                "-o".into(),
+                SAFE_MOUNT_OPTIONS.into(),
+                disk::device_path(&device.name),
+                mount_point,
+            ],
             op: InteractiveOp::Mount,
             device_name: device.name,
             context,
@@ -367,6 +394,7 @@ impl App {
 
     /// Unmount the selected device (udisksctl first, sudo umount as fallback).
     pub fn unmount_selected(&mut self, runner: &dyn CommandRunner) -> Option<InteractiveRequest> {
+        self.clear_force_confirm();
         let Some(device) = self.selected_device() else {
             self.action = ActionStatus::Error("No device selected".into());
             return None;
@@ -426,15 +454,36 @@ impl App {
     }
 
     /// Force lazy unmount; falls back from the device path to the mount point.
+    ///
+    /// Two presses are required: the first one runs the full pre-check and only
+    /// arms the confirmation, the second one on the same device issues the
+    /// request. Navigation and any other operation cancel the pending state.
     pub fn force_unmount_selected(&mut self) -> Option<InteractiveRequest> {
         let Some(device) = self.selected_device() else {
+            self.clear_force_confirm();
             self.action = ActionStatus::Error("No device selected".into());
             return None;
         };
 
         if !self.unmount_precheck(&device) {
+            // A failed pre-check never arms (and drops an older arming).
+            self.clear_force_confirm();
             return None;
         }
+
+        if self.force_confirm.as_deref() != Some(device.name.as_str()) {
+            self.force_confirm = Some(device.name.clone());
+            self.action = ActionStatus::Error(force_confirm_prompt(&device.name));
+            return None;
+        }
+
+        // Confirmed: consume the pending state and re-check, the device may
+        // have changed state between the two presses.
+        self.force_confirm = None;
+        if !self.unmount_precheck(&device) {
+            return None;
+        }
+        self.action = ActionStatus::Unmounting;
 
         let dev_path = disk::device_path(&device.name);
         let mount_point = device.mountpoints.first().cloned().unwrap_or_default();
@@ -454,6 +503,25 @@ impl App {
         })
     }
 
+    /// Drop a pending force-unmount confirmation. When the status bar still
+    /// shows the confirmation prompt it falls back to the neutral `Ready`
+    /// state, so a cancelled prompt never lingers (it would otherwise be a
+    /// stale red warning).
+    pub fn clear_force_confirm(&mut self) {
+        if self.force_confirm.take().is_none() {
+            return;
+        }
+        let shows_prompt = match &self.action {
+            ActionStatus::Success(message) | ActionStatus::Error(message) => {
+                message.starts_with(FORCE_CONFIRM_PROMPT)
+            }
+            _ => false,
+        };
+        if shows_prompt {
+            self.action = ActionStatus::None;
+        }
+    }
+
     /// Called by `main` after the interactive command finished: refresh first,
     /// then report the real mount point (falling back to the planned one).
     pub fn finish(&mut self, runner: &dyn CommandRunner, request: InteractiveRequest, ok: bool) {
@@ -467,10 +535,13 @@ impl App {
         self.action = outcome_status(&request, ok, mount_point);
     }
 
-    /// Manual refresh ('r'): reload devices and surface failures in the status bar.
+    /// Manual refresh ('r'): reload devices, report the result in the status bar.
+    /// The success message replaces any stale status (e.g. an old error).
     pub fn refresh(&mut self, runner: &dyn CommandRunner) {
-        if let Err(e) = self.reload_devices(runner) {
-            self.action = ActionStatus::Error(format!("Refresh failed: {}", e));
+        self.clear_force_confirm();
+        match self.reload_devices(runner) {
+            Ok(()) => self.action = ActionStatus::Success("Refreshed".into()),
+            Err(e) => self.action = ActionStatus::Error(format!("Refresh failed: {}", e)),
         }
     }
 
@@ -531,6 +602,14 @@ impl App {
         let index = self.list_state.selected().unwrap_or(0).min(len - 1);
         self.list_state.select(Some(index));
     }
+}
+
+/// Status text of the first `f` press, before the force unmount is issued.
+fn force_confirm_prompt(device_name: &str) -> String {
+    format!(
+        "{} {} (lazy unmount may lose data)",
+        FORCE_CONFIRM_PROMPT, device_name
+    )
 }
 
 /// Extract the mount point from `udisksctl mount` output:
@@ -868,6 +947,209 @@ mod tests {
         }
     }
 
+    /// A mounted, non-system device: the force pre-check passes.
+    fn forceable_app() -> App {
+        let mut app = app_with(vec![with_mounts(
+            bd("sdb1", "part", Some("ext4"), None),
+            &["/mnt/data"],
+        )]);
+        app.list_state.select(Some(0));
+        app
+    }
+
+    fn force_prompt_shown(app: &App) -> bool {
+        match &app.action {
+            ActionStatus::Success(message) | ActionStatus::Error(message) => {
+                message.starts_with(FORCE_CONFIRM_PROMPT)
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn force_unmount_arms_on_the_first_press_and_runs_on_the_second() {
+        let mut app = forceable_app();
+
+        // First `f`: pre-check passes, the confirmation is armed, nothing runs.
+        assert!(app.force_unmount_selected().is_none());
+        assert_eq!(app.force_confirm.as_deref(), Some("sdb1"));
+        match &app.action {
+            ActionStatus::Error(message) => {
+                assert!(
+                    message.contains("Press f again to force-unmount sdb1"),
+                    "{}",
+                    message
+                );
+                assert!(
+                    message.contains("lazy unmount may lose data"),
+                    "{}",
+                    message
+                );
+            }
+            other => panic!("expected the confirmation prompt, got {:?}", other),
+        }
+
+        // Second `f` on the same device issues the real request.
+        let request = app
+            .force_unmount_selected()
+            .expect("second press issues the request");
+        assert_eq!(request.op, InteractiveOp::ForceUnmount);
+        assert_eq!(
+            request.args,
+            vec!["umount".to_string(), "-l".into(), "/dev/sdb1".into()]
+        );
+        assert_eq!(
+            request.fallback_args,
+            Some(vec!["umount".to_string(), "-l".into(), "/mnt/data".into()])
+        );
+        assert_eq!(app.force_confirm, None);
+    }
+
+    #[test]
+    fn list_navigation_cancels_the_force_confirmation_prompt() {
+        let navigations: [fn(&mut App); 7] = [
+            App::navigate_up,
+            App::navigate_down,
+            App::select_first,
+            App::select_last,
+            App::page_up,
+            App::page_down,
+            App::toggle_collapse,
+        ];
+
+        for navigate in navigations {
+            let mut app = forceable_app();
+            app.force_unmount_selected();
+            assert!(app.force_confirm.is_some());
+            assert!(force_prompt_shown(&app));
+
+            navigate(&mut app);
+
+            assert_eq!(
+                app.force_confirm, None,
+                "pending confirmation must be dropped"
+            );
+            assert_eq!(
+                app.action,
+                ActionStatus::None,
+                "a cancelled confirmation must not linger in the status bar"
+            );
+        }
+    }
+
+    #[test]
+    fn other_operations_cancel_the_force_confirmation() {
+        // `u` on the armed device.
+        let mut app = forceable_app();
+        app.force_unmount_selected();
+        let runner = FakeRunner::new()
+            .push_ok("Unmounted /dev/sdb1.")
+            .push_ok(UNMOUNTED_JSON);
+        assert!(app.unmount_selected(&runner).is_none());
+        assert_eq!(app.force_confirm, None);
+        assert!(!force_prompt_shown(&app));
+
+        // `m` on the armed (already mounted) device is refused, but still cancels.
+        let mut app = forceable_app();
+        app.force_unmount_selected();
+        let runner = no_commands();
+        assert!(app.mount_selected(&runner).is_none());
+        assert_eq!(app.force_confirm, None);
+        assert!(!force_prompt_shown(&app));
+
+        // Enter follows the mounted branch (unmount) and also cancels.
+        let mut app = forceable_app();
+        app.force_unmount_selected();
+        let runner = FakeRunner::new()
+            .push_ok("Unmounted /dev/sdb1.")
+            .push_ok(UNMOUNTED_JSON);
+        assert!(app.enter_selected(&runner).is_none());
+        assert_eq!(app.force_confirm, None);
+
+        // Manual refresh cancels; its own status then replaces the prompt.
+        let mut app = forceable_app();
+        app.force_unmount_selected();
+        let runner = FakeRunner::new().push_ok(MOUNTED_JSON);
+        app.refresh(&runner);
+        assert_eq!(app.force_confirm, None);
+        assert_eq!(app.action, ActionStatus::Success("Refreshed".into()));
+    }
+
+    #[test]
+    fn force_precheck_failure_does_not_arm_the_confirmation() {
+        // Not mounted.
+        let mut app = app_with(vec![bd("sdb1", "part", Some("ext4"), None)]);
+        app.list_state.select(Some(0));
+        assert!(app.force_unmount_selected().is_none());
+        assert_eq!(app.force_confirm, None);
+        assert!(!force_prompt_shown(&app));
+        match &app.action {
+            ActionStatus::Error(message) => {
+                assert!(message.contains("is not mounted"), "{}", message)
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
+
+        // System mount.
+        let mut app = app_with(vec![bd("sda2", "part", Some("ext4"), Some("/usr"))]);
+        app.list_state.select(Some(0));
+        assert!(app.force_unmount_selected().is_none());
+        assert_eq!(app.force_confirm, None);
+        assert!(!force_prompt_shown(&app));
+
+        // Multiple mount points.
+        let mut app = app_with(vec![with_mounts(
+            bd("sdb1", "part", Some("ext4"), None),
+            &["/mnt/a", "/mnt/b"],
+        )]);
+        app.list_state.select(Some(0));
+        assert!(app.force_unmount_selected().is_none());
+        assert_eq!(app.force_confirm, None);
+        assert!(!force_prompt_shown(&app));
+    }
+
+    #[test]
+    fn second_force_press_rechecks_before_running() {
+        let mut app = forceable_app();
+        app.force_unmount_selected();
+        assert!(app.force_confirm.is_some());
+
+        // The device got unmounted between the two presses: the second press
+        // must fail the pre-check instead of running `umount`.
+        app.set_devices(vec![bd("sdb1", "part", Some("ext4"), None)]);
+        assert!(app.force_unmount_selected().is_none());
+        assert_eq!(app.force_confirm, None);
+        match &app.action {
+            ActionStatus::Error(message) => {
+                assert!(message.contains("is not mounted"), "{}", message)
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sudo_mount_fallback_uses_safe_mount_options() {
+        with_temp_home(|home| {
+            let runner = FakeRunner::new().push_fail("Error: not authorized");
+            let mut app = app_with(vec![bd("sdb1", "part", Some("vfat"), None)]);
+            app.list_state.select(Some(0));
+
+            let request = app.mount_selected(&runner).expect("sudo fallback request");
+            assert_eq!(
+                request.args,
+                vec![
+                    "mount".to_string(),
+                    "-o".into(),
+                    SAFE_MOUNT_OPTIONS.into(),
+                    "/dev/sdb1".into(),
+                    format!("{}/mnt/sdb1", home.display()),
+                ]
+            );
+            // Only udisksctl ran before the fallback was built.
+            assert_eq!(runner.call_count(), 1);
+        });
+    }
+
     #[test]
     fn multi_mount_system_protection_checks_every_mountpoint() {
         let mut app = app_with(vec![with_mounts(
@@ -1085,9 +1367,11 @@ mod tests {
             assert_eq!(request.op, InteractiveOp::Mount);
             assert_eq!(request.device_name, "sdb1");
             assert_eq!(request.args[0], "mount");
-            assert_eq!(request.args[1], "/dev/sdb1");
+            assert_eq!(request.args[1], "-o");
+            assert_eq!(request.args[2], SAFE_MOUNT_OPTIONS);
+            assert_eq!(request.args[3], "/dev/sdb1");
             assert_eq!(
-                request.args[2],
+                request.args[4],
                 format!("{}/mnt/sdb1", home.display()),
                 "mount point must live under HOME"
             );
@@ -1218,8 +1502,26 @@ mod tests {
 
         assert_eq!(app.devices.len(), 1);
         assert_eq!(app.devices[0].name, "sdb1");
-        assert!(matches!(app.action, ActionStatus::None));
+        // A successful manual refresh clears a stale status instead of leaving
+        // the old message (e.g. an earlier error) on screen.
+        assert_eq!(app.action, ActionStatus::Success("Refreshed".into()));
         assert_eq!(runner.call_count(), 1);
+    }
+
+    #[test]
+    fn refresh_success_clears_a_previous_error() {
+        let runner = FakeRunner::new()
+            .push_fail("lsblk: no devices")
+            .push_fail("lsblk: no devices")
+            .push_ok(MOUNTED_JSON);
+        let mut app = app_with(vec![bd("sda", "disk", None, None)]);
+
+        app.refresh(&runner);
+        assert!(matches!(app.action, ActionStatus::Error(_)));
+
+        app.refresh(&runner);
+        assert_eq!(app.action, ActionStatus::Success("Refreshed".into()));
+        assert_eq!(runner.call_count(), 3);
     }
 
     #[test]
