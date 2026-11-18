@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Mock old `lsblk` for tests/e2e: rejects the MOUNTPOINTS column (exit 32) and
+# emits the legacy MOUNTPOINT-only JSON. Every call is appended to
+# $MOCK_STATE/legacy.log so the fallback can be verified.
+set -u
+
+if [ -z "${MOCK_STATE:-}" ]; then
+    echo "mock legacy lsblk: MOCK_STATE is not set" >&2
+    exit 1
+fi
+
+printf 'lsblk %s\n' "$*" >>"$MOCK_STATE/legacy.log"
+
+for arg in "$@"; do
+    case "$arg" in
+        *MOUNTPOINTS*)
+            echo "lsblk: unknown column: MOUNTPOINTS" >&2
+            exit 32
+            ;;
+    esac
+done
+
+cat <<'EOF'
+{"blockdevices":[
+ {"name":"legacy","size":"64G","type":"disk","fstype":null,"mountpoint":null,"label":null,"model":"LEGACY-DISK","vendor":null,"tran":"sata","serial":null,"uuid":null,"ro":false,"rm":false,"children":[
+   {"name":"legacy1","size":"64G","type":"part","fstype":"ext4","mountpoint":"/legacy/mnt","label":"LEGACY","model":null,"vendor":null,"tran":null,"serial":null,"uuid":null,"ro":true,"rm":true}
+ ]}
+]}
+EOF

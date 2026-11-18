@@ -1,0 +1,1303 @@
+use std::collections::HashSet;
+
+use ratatui::widgets::ListState;
+
+use crate::disk::{self, BlockDevice};
+use crate::runner::{CommandRunner, CommandSpec};
+
+/// Number of rows jumped by PageUp / PageDown.
+const PAGE_STEP: usize = 10;
+
+/// Represents a flattened view item in the TUI list
+#[derive(Debug, Clone)]
+pub struct DeviceItem {
+    pub device: BlockDevice,
+    pub depth: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActionStatus {
+    None,
+    Mounting,
+    Unmounting,
+    Success(String),
+    Error(String),
+}
+
+/// What kind of operation an [`InteractiveRequest`] performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractiveOp {
+    Mount,
+    Unmount,
+    ForceUnmount,
+}
+
+/// A command that needs the real terminal (sudo password prompt).
+///
+/// The App never touches terminal state: it only describes the request. `main`
+/// suspends the TUI, runs it with inherited stdio and reports back through
+/// [`App::finish`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct InteractiveRequest {
+    pub program: String,
+    pub args: Vec<String>,
+    pub op: InteractiveOp,
+    pub device_name: String,
+    /// Human readable context from the failed non-interactive attempt
+    /// (usually `udisksctl`'s stderr).
+    pub context: String,
+    /// Optional second attempt, used by force unmount (device path → mount point).
+    pub fallback_args: Option<Vec<String>>,
+}
+
+pub struct App {
+    pub devices: Vec<BlockDevice>,
+    /// Collapsed device names (not indices) so the state survives refreshes.
+    pub collapsed: HashSet<String>,
+    pub list_state: ListState,
+    pub action: ActionStatus,
+    pub running: bool,
+}
+
+impl App {
+    pub fn new(devices: Vec<BlockDevice>) -> Self {
+        let mut app = Self {
+            devices,
+            collapsed: HashSet::new(),
+            list_state: ListState::default(),
+            action: ActionStatus::None,
+            running: true,
+        };
+        app.clamp_selection();
+        app
+    }
+
+    /// Build a flat list for display: every device recursively, children only
+    /// when their parent is expanded.
+    pub fn flat_items(&self) -> Vec<DeviceItem> {
+        let mut items = Vec::new();
+        for device in &self.devices {
+            Self::push_items(&mut items, device, 0, &self.collapsed);
+        }
+        items
+    }
+
+    fn push_items(
+        items: &mut Vec<DeviceItem>,
+        device: &BlockDevice,
+        depth: usize,
+        collapsed: &HashSet<String>,
+    ) {
+        items.push(DeviceItem {
+            device: device.clone(),
+            depth,
+        });
+        if collapsed.contains(&device.name) {
+            return;
+        }
+        if let Some(children) = &device.children {
+            for child in children {
+                Self::push_items(items, child, depth + 1, collapsed);
+            }
+        }
+    }
+
+    pub fn has_children(device: &BlockDevice) -> bool {
+        device
+            .children
+            .as_ref()
+            .is_some_and(|children| !children.is_empty())
+    }
+
+    pub fn is_collapsed(&self, name: &str) -> bool {
+        self.collapsed.contains(name)
+    }
+
+    pub fn selected_device(&self) -> Option<BlockDevice> {
+        self.flat_items()
+            .get(self.list_state.selected().unwrap_or(0))
+            .map(|item| item.device.clone())
+    }
+
+    pub fn selected_item(&self) -> Option<DeviceItem> {
+        self.flat_items()
+            .get(self.list_state.selected().unwrap_or(0))
+            .cloned()
+    }
+
+    pub fn navigate_up(&mut self) {
+        let index = self.list_state.selected().unwrap_or(0).saturating_sub(1);
+        if !self.flat_items().is_empty() {
+            self.list_state.select(Some(index));
+        }
+    }
+
+    pub fn navigate_down(&mut self) {
+        let len = self.flat_items().len();
+        if len == 0 {
+            return;
+        }
+        let index = (self.list_state.selected().unwrap_or(0) + 1).min(len - 1);
+        self.list_state.select(Some(index));
+    }
+
+    pub fn select_first(&mut self) {
+        if !self.flat_items().is_empty() {
+            self.list_state.select(Some(0));
+        }
+    }
+
+    pub fn select_last(&mut self) {
+        let len = self.flat_items().len();
+        if len > 0 {
+            self.list_state.select(Some(len - 1));
+        }
+    }
+
+    pub fn page_up(&mut self) {
+        if self.flat_items().is_empty() {
+            return;
+        }
+        let index = self
+            .list_state
+            .selected()
+            .unwrap_or(0)
+            .saturating_sub(PAGE_STEP);
+        self.list_state.select(Some(index));
+    }
+
+    pub fn page_down(&mut self) {
+        let len = self.flat_items().len();
+        if len == 0 {
+            return;
+        }
+        let index = (self.list_state.selected().unwrap_or(0) + PAGE_STEP).min(len - 1);
+        self.list_state.select(Some(index));
+    }
+
+    /// Collapse / expand the selected node (any level that has children).
+    pub fn toggle_collapse(&mut self) {
+        let Some(item) = self.selected_item() else {
+            return;
+        };
+        if !Self::has_children(&item.device) {
+            return;
+        }
+        if !self.collapsed.remove(&item.device.name) {
+            self.collapsed.insert(item.device.name);
+        }
+        self.clamp_selection();
+    }
+
+    /// Find a device by name at any depth of the tree.
+    pub fn find_device(&self, name: &str) -> Option<BlockDevice> {
+        fn find(devices: &[BlockDevice], name: &str) -> Option<BlockDevice> {
+            for device in devices {
+                if device.name == name {
+                    return Some(device.clone());
+                }
+                if let Some(children) = &device.children {
+                    if let Some(found) = find(children, name) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+        find(&self.devices, name)
+    }
+
+    /// First mount point currently reported for the device.
+    fn current_mountpoint(&self, name: &str) -> Option<String> {
+        self.find_device(name)
+            .and_then(|device| device.mountpoints.first().cloned())
+    }
+
+    /// Enter: mount when unmounted, unmount when mounted, explain otherwise.
+    pub fn enter_selected(&mut self, runner: &dyn CommandRunner) -> Option<InteractiveRequest> {
+        let Some(device) = self.selected_device() else {
+            self.action = ActionStatus::Error("No device selected".into());
+            return None;
+        };
+
+        if disk::is_mounted(&device) {
+            self.unmount_selected(runner)
+        } else if disk::is_mountable(&device) {
+            self.mount_selected(runner)
+        } else {
+            self.action = ActionStatus::Error(format!(
+                "{} cannot be mounted (type: {}, fstype: {})",
+                device.name,
+                device.device_type,
+                device.fstype.as_deref().unwrap_or("none")
+            ));
+            None
+        }
+    }
+
+    /// Mount the selected device (udisksctl first, sudo mount as fallback).
+    pub fn mount_selected(&mut self, runner: &dyn CommandRunner) -> Option<InteractiveRequest> {
+        let Some(device) = self.selected_device() else {
+            self.action = ActionStatus::Error("No device selected".into());
+            return None;
+        };
+
+        if !disk::is_mountable(&device) {
+            self.action =
+                ActionStatus::Error(format!("{} cannot be mounted (no filesystem)", device.name));
+            return None;
+        }
+
+        if disk::is_mounted(&device) {
+            self.action = ActionStatus::Error(format!(
+                "{} is already mounted at {}",
+                device.name,
+                device.mountpoints.join(", ")
+            ));
+            return None;
+        }
+
+        self.action = ActionStatus::Mounting;
+
+        let dev_path = disk::device_path(&device.name);
+
+        match runner.output(&CommandSpec::new(
+            "udisksctl",
+            &["mount", "-b", dev_path.as_str()],
+        )) {
+            Ok(output) if output.success => {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let _ = self.reload_devices(runner);
+                let mount_point = self
+                    .current_mountpoint(&device.name)
+                    .or_else(|| parse_udisks_mountpoint(&stdout));
+                self.action = ActionStatus::Success(format!(
+                    "Mounted {} at {}",
+                    dev_path,
+                    mount_point.unwrap_or_else(|| "?".into())
+                ));
+                None
+            }
+            Ok(output) => {
+                // Only the sudo path needs a local mount point; udisksctl picks
+                // /media/<user>/<label> itself.
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                self.sudo_mount_request(device, stderr)
+            }
+            Err(e) => self.sudo_mount_request(device, format!("udisksctl error: {}", e)),
+        }
+    }
+
+    /// Build the interactive `sudo mount` fallback (mount point created here only).
+    fn sudo_mount_request(
+        &mut self,
+        device: BlockDevice,
+        context: String,
+    ) -> Option<InteractiveRequest> {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let mount_point = format!("{}/mnt/{}", home, device.name);
+        if let Err(e) = std::fs::create_dir_all(&mount_point) {
+            self.action = ActionStatus::Error(format!(
+                "Failed to create mount point {}: {}",
+                mount_point, e
+            ));
+            return None;
+        }
+        Some(InteractiveRequest {
+            program: "sudo".into(),
+            args: vec!["mount".into(), disk::device_path(&device.name), mount_point],
+            op: InteractiveOp::Mount,
+            device_name: device.name,
+            context,
+            fallback_args: None,
+        })
+    }
+
+    /// Find processes using a device (for busy errors)
+    fn find_busy_processes(runner: &dyn CommandRunner, dev_path: &str) -> String {
+        // Try fuser first
+        if let Ok(output) = runner.output(&CommandSpec::new("fuser", &["-vm", dev_path])) {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let info = format!("{}\n{}", stdout, stderr).trim().to_string();
+            if !info.is_empty() && info != dev_path {
+                return format!("Processes using {}:\n{}\n", dev_path, info);
+            }
+        }
+        // Try lsof as fallback
+        if let Ok(output) = runner.output(&CommandSpec::new("lsof", &[dev_path])) {
+            let info = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !info.is_empty() {
+                return format!("Processes using {}:\n{}\n", dev_path, info);
+            }
+        }
+        String::new()
+    }
+
+    /// Shared pre-checks for unmount / force unmount. Returns `true` when the
+    /// operation may proceed; otherwise the status bar already explains why and
+    /// no command must be run.
+    fn unmount_precheck(&mut self, device: &BlockDevice) -> bool {
+        if !disk::is_mounted(device) {
+            self.action = ActionStatus::Error(format!("{} is not mounted", device.name));
+            return false;
+        }
+
+        if disk::is_system_mount(device) {
+            self.action = ActionStatus::Error(format!(
+                "Refusing to unmount {}: system mount",
+                device.mountpoints.join(", ")
+            ));
+            return false;
+        }
+
+        // Multiple mount points (bind mounts, ...) can only be detached safely
+        // by hand: refuse before any udisksctl / sudo attempt.
+        if device.mountpoints.len() > 1 {
+            self.action = ActionStatus::Error(format!(
+                "{} has {} mount points; unmount manually (e.g. sudo umount <mp>)",
+                device.name,
+                device.mountpoints.len()
+            ));
+            return false;
+        }
+
+        true
+    }
+
+    /// Unmount the selected device (udisksctl first, sudo umount as fallback).
+    pub fn unmount_selected(&mut self, runner: &dyn CommandRunner) -> Option<InteractiveRequest> {
+        let Some(device) = self.selected_device() else {
+            self.action = ActionStatus::Error("No device selected".into());
+            return None;
+        };
+
+        if !self.unmount_precheck(&device) {
+            return None;
+        }
+
+        self.action = ActionStatus::Unmounting;
+
+        let dev_path = disk::device_path(&device.name);
+
+        match runner.output(&CommandSpec::new(
+            "udisksctl",
+            &["unmount", "-b", dev_path.as_str()],
+        )) {
+            Ok(output) if output.success => {
+                let _ = self.reload_devices(runner);
+                self.action = ActionStatus::Success(format!("Unmounted {}", dev_path));
+                None
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                self.sudo_unmount_request(runner, device, stderr)
+            }
+            Err(e) => self.sudo_unmount_request(runner, device, format!("udisksctl error: {}", e)),
+        }
+    }
+
+    /// Build the interactive `sudo umount` fallback.
+    fn sudo_unmount_request(
+        &mut self,
+        runner: &dyn CommandRunner,
+        device: BlockDevice,
+        stderr: String,
+    ) -> Option<InteractiveRequest> {
+        let dev_path = disk::device_path(&device.name);
+        let is_busy = stderr.to_lowercase().contains("busy");
+        let mut context = format!("udisksctl: {}", stderr);
+        if is_busy {
+            let busy_info = Self::find_busy_processes(runner, &dev_path);
+            if busy_info.is_empty() {
+                context.push_str(" (device busy)");
+            } else {
+                context.push_str(&format!(" busy: {}", busy_info.trim()));
+            }
+        }
+        Some(InteractiveRequest {
+            program: "sudo".into(),
+            args: vec!["umount".into(), dev_path],
+            op: InteractiveOp::Unmount,
+            device_name: device.name,
+            context,
+            fallback_args: None,
+        })
+    }
+
+    /// Force lazy unmount; falls back from the device path to the mount point.
+    pub fn force_unmount_selected(&mut self) -> Option<InteractiveRequest> {
+        let Some(device) = self.selected_device() else {
+            self.action = ActionStatus::Error("No device selected".into());
+            return None;
+        };
+
+        if !self.unmount_precheck(&device) {
+            return None;
+        }
+
+        let dev_path = disk::device_path(&device.name);
+        let mount_point = device.mountpoints.first().cloned().unwrap_or_default();
+        let fallback_args = if mount_point.is_empty() {
+            None
+        } else {
+            Some(vec!["umount".to_string(), "-l".to_string(), mount_point])
+        };
+
+        Some(InteractiveRequest {
+            program: "sudo".into(),
+            args: vec!["umount".into(), "-l".into(), dev_path],
+            op: InteractiveOp::ForceUnmount,
+            device_name: device.name,
+            context: String::new(),
+            fallback_args,
+        })
+    }
+
+    /// Called by `main` after the interactive command finished: refresh first,
+    /// then report the real mount point (falling back to the planned one).
+    pub fn finish(&mut self, runner: &dyn CommandRunner, request: InteractiveRequest, ok: bool) {
+        let _ = self.reload_devices(runner);
+        let mount_point = if request.op == InteractiveOp::Mount && ok {
+            self.current_mountpoint(&request.device_name)
+                .or_else(|| request.args.last().cloned())
+        } else {
+            None
+        };
+        self.action = outcome_status(&request, ok, mount_point);
+    }
+
+    /// Manual refresh ('r'): reload devices and surface failures in the status bar.
+    pub fn refresh(&mut self, runner: &dyn CommandRunner) {
+        if let Err(e) = self.reload_devices(runner) {
+            self.action = ActionStatus::Error(format!("Refresh failed: {}", e));
+        }
+    }
+
+    /// Replace the device tree only when it actually changed.
+    ///
+    /// Returns `true` when the tree was replaced (the caller must redraw),
+    /// `false` when it was identical. The selection and collapse state survive
+    /// via [`App::set_devices`].
+    pub fn update_devices(&mut self, devices: Vec<BlockDevice>) -> bool {
+        if devices == self.devices {
+            return false;
+        }
+        self.set_devices(devices);
+        true
+    }
+
+    /// Periodic refresh used by the main loop. Failures stay silent so a
+    /// transient `lsblk` error never overwrites the status bar.
+    pub fn auto_refresh(&mut self, runner: &dyn CommandRunner) -> bool {
+        match disk::get_block_devices(runner) {
+            Ok(devices) => self.update_devices(devices),
+            Err(_) => false,
+        }
+    }
+
+    fn reload_devices(&mut self, runner: &dyn CommandRunner) -> anyhow::Result<()> {
+        let devices = disk::get_block_devices(runner)?;
+        self.set_devices(devices);
+        Ok(())
+    }
+
+    /// Replace the device tree while keeping the selection on the same device.
+    pub fn set_devices(&mut self, devices: Vec<BlockDevice>) {
+        let previous = self.selected_device().map(|device| device.name);
+        self.devices = devices;
+        self.restore_selection(previous);
+    }
+
+    fn restore_selection(&mut self, previous_name: Option<String>) {
+        let items = self.flat_items();
+        if items.is_empty() {
+            self.list_state.select(None);
+            return;
+        }
+        let fallback = self.list_state.selected().unwrap_or(0);
+        let index = previous_name
+            .and_then(|name| items.iter().position(|item| item.device.name == name))
+            .unwrap_or(fallback);
+        self.list_state.select(Some(index.min(items.len() - 1)));
+    }
+
+    fn clamp_selection(&mut self) {
+        let len = self.flat_items().len();
+        if len == 0 {
+            self.list_state.select(None);
+            return;
+        }
+        let index = self.list_state.selected().unwrap_or(0).min(len - 1);
+        self.list_state.select(Some(index));
+    }
+}
+
+/// Extract the mount point from `udisksctl mount` output:
+/// `Mounted /dev/sdb1 at /media/user/USB.`
+fn parse_udisks_mountpoint(stdout: &str) -> Option<String> {
+    let line = stdout.trim().trim_end_matches('.');
+    let (_, mount_point) = line.split_once(" at ")?;
+    let mount_point = mount_point.trim();
+    if mount_point.is_empty() {
+        None
+    } else {
+        Some(mount_point.to_string())
+    }
+}
+
+/// Status bar text for a finished interactive operation.
+fn outcome_status(
+    request: &InteractiveRequest,
+    ok: bool,
+    mount_point: Option<String>,
+) -> ActionStatus {
+    let dev_path = disk::device_path(&request.device_name);
+    match (request.op, ok) {
+        (InteractiveOp::Mount, true) => ActionStatus::Success(format!(
+            "Mounted {} at {}",
+            dev_path,
+            mount_point.unwrap_or_else(|| "?".into())
+        )),
+        (InteractiveOp::Mount, false) => ActionStatus::Error(format!(
+            "Mount failed for {}: {}",
+            dev_path, request.context
+        )),
+        (InteractiveOp::Unmount, true) => ActionStatus::Success(format!("Unmounted {}", dev_path)),
+        (InteractiveOp::Unmount, false) => {
+            let hint = if request.context.to_lowercase().contains("busy") {
+                "\nDevice busy. Press 'f' for force lazy unmount."
+            } else {
+                ""
+            };
+            ActionStatus::Error(format!(
+                "Unmount failed for {}: {}{}",
+                dev_path, request.context, hint
+            ))
+        }
+        (InteractiveOp::ForceUnmount, true) => ActionStatus::Success(format!(
+            "Force unmounted {} (lazy: detached, cleaned up when no longer busy)",
+            dev_path
+        )),
+        (InteractiveOp::ForceUnmount, false) => ActionStatus::Error(format!(
+            "Force unmount failed for {}: {}",
+            dev_path, request.context
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runner::fake::FakeRunner;
+
+    fn bd(name: &str, device_type: &str, fstype: Option<&str>, mp: Option<&str>) -> BlockDevice {
+        BlockDevice {
+            name: name.to_string(),
+            size: "1G".to_string(),
+            device_type: device_type.to_string(),
+            fstype: fstype.map(str::to_string),
+            mountpoints: mp.map(str::to_string).into_iter().collect(),
+            label: None,
+            ro: false,
+            rm: false,
+            model: None,
+            vendor: None,
+            tran: None,
+            serial: None,
+            uuid: None,
+            children: None,
+        }
+    }
+
+    fn with_mounts(mut device: BlockDevice, mountpoints: &[&str]) -> BlockDevice {
+        device.mountpoints = mountpoints.iter().map(|mp| mp.to_string()).collect();
+        device
+    }
+
+    fn with_children(mut device: BlockDevice, children: Vec<BlockDevice>) -> BlockDevice {
+        device.children = Some(children);
+        device
+    }
+
+    /// usb disk → two partitions, one of which carries a crypt child
+    fn sample_tree() -> Vec<BlockDevice> {
+        vec![
+            with_children(
+                bd("sda", "disk", None, None),
+                vec![
+                    bd("sda1", "part", Some("ext4"), Some("/boot")),
+                    bd("sda2", "part", Some("swap"), None),
+                ],
+            ),
+            with_children(
+                bd("sdb", "disk", None, None),
+                vec![with_children(
+                    bd("sdb1", "part", Some("crypto_LUKS"), None),
+                    vec![bd("sdb1-crypt", "crypt", Some("ext4"), None)],
+                )],
+            ),
+        ]
+    }
+
+    fn app_with(devices: Vec<BlockDevice>) -> App {
+        App::new(devices)
+    }
+
+    /// A runner with no queued results: any command would panic, so a test
+    /// asserting zero calls also proves that no command was attempted.
+    fn no_commands() -> FakeRunner {
+        FakeRunner::new()
+    }
+
+    #[test]
+    fn flat_items_expands_every_level() {
+        let app = app_with(sample_tree());
+        let names: Vec<(String, usize)> = app
+            .flat_items()
+            .into_iter()
+            .map(|item| (item.device.name, item.depth))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("sda".to_string(), 0),
+                ("sda1".to_string(), 1),
+                ("sda2".to_string(), 1),
+                ("sdb".to_string(), 0),
+                ("sdb1".to_string(), 1),
+                ("sdb1-crypt".to_string(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn collapse_hides_all_descendants() {
+        let mut app = app_with(sample_tree());
+        app.list_state.select(Some(3)); // sdb
+        assert_eq!(app.selected_device().unwrap().name, "sdb");
+        app.toggle_collapse();
+        assert!(app.is_collapsed("sdb"));
+        let names: Vec<String> = app
+            .flat_items()
+            .into_iter()
+            .map(|item| item.device.name)
+            .collect();
+        assert_eq!(names, vec!["sda", "sda1", "sda2", "sdb"]);
+
+        // Toggling again expands.
+        app.toggle_collapse();
+        assert!(!app.is_collapsed("sdb"));
+        assert_eq!(app.flat_items().len(), 6);
+    }
+
+    #[test]
+    fn nested_node_can_be_collapsed() {
+        let mut app = app_with(sample_tree());
+        app.list_state.select(Some(4)); // sdb1 (depth 1, has a child)
+        app.toggle_collapse();
+        assert!(app.is_collapsed("sdb1"));
+        let names: Vec<String> = app
+            .flat_items()
+            .into_iter()
+            .map(|item| item.device.name)
+            .collect();
+        assert_eq!(names, vec!["sda", "sda1", "sda2", "sdb", "sdb1"]);
+        // A leaf cannot be collapsed.
+        app.list_state.select(Some(1)); // sda1
+        app.toggle_collapse();
+        assert_eq!(app.collapsed.len(), 1);
+        assert!(app.is_collapsed("sdb1"));
+    }
+
+    #[test]
+    fn collapse_state_survives_refresh_by_name() {
+        let mut app = app_with(sample_tree());
+        app.collapsed.insert("sdb".to_string());
+        // Re-parse the same tree, but with an extra disk in front: indices shift.
+        let mut devices = vec![bd("sdc", "disk", None, None)];
+        devices.extend(sample_tree());
+        app.set_devices(devices);
+        // sdb is now at a different index but stays collapsed.
+        assert!(app.is_collapsed("sdb"));
+        let names: Vec<String> = app
+            .flat_items()
+            .into_iter()
+            .map(|item| item.device.name)
+            .collect();
+        assert!(names.contains(&"sdb".to_string()));
+        assert!(!names.contains(&"sdb1".to_string()));
+        assert!(!names.contains(&"sdb1-crypt".to_string()));
+    }
+
+    #[test]
+    fn selection_follows_device_name_across_refresh() {
+        let mut app = app_with(sample_tree());
+        app.list_state.select(Some(4)); // sdb1
+        let mut devices = vec![bd("sdc", "disk", None, None)];
+        devices.extend(sample_tree());
+        app.set_devices(devices);
+        assert_eq!(app.selected_device().unwrap().name, "sdb1");
+        assert_eq!(app.list_state.selected(), Some(5));
+    }
+
+    #[test]
+    fn selection_is_clamped_when_device_disappears() {
+        let mut app = app_with(sample_tree());
+        app.list_state.select(Some(5)); // sdb1-crypt
+        app.set_devices(vec![bd("sda", "disk", None, None)]);
+        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(app.selected_device().unwrap().name, "sda");
+
+        app.set_devices(Vec::new());
+        assert_eq!(app.list_state.selected(), None);
+        assert!(app.selected_device().is_none());
+    }
+
+    #[test]
+    fn navigation_stays_in_range() {
+        let mut app = app_with(sample_tree());
+        app.select_first();
+        app.navigate_up();
+        assert_eq!(app.list_state.selected(), Some(0));
+        app.select_last();
+        app.navigate_down();
+        assert_eq!(app.list_state.selected(), Some(5));
+        app.page_up();
+        assert_eq!(app.list_state.selected(), Some(0));
+        app.page_down();
+        assert_eq!(app.list_state.selected(), Some(5));
+        app.navigate_up();
+        assert_eq!(app.list_state.selected(), Some(4));
+    }
+
+    #[test]
+    fn unmounting_a_system_mount_is_refused() {
+        let mut app = app_with(vec![bd("sda1", "part", Some("ext4"), Some("/"))]);
+        app.list_state.select(Some(0));
+        let runner = no_commands();
+        let request = app.unmount_selected(&runner);
+        assert!(request.is_none());
+        assert_eq!(runner.call_count(), 0);
+        match &app.action {
+            ActionStatus::Error(message) => {
+                assert!(message.contains("Refusing to unmount /"), "{}", message);
+                assert!(message.contains("system mount"), "{}", message);
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn force_unmounting_a_system_mount_is_refused() {
+        let mut app = app_with(vec![bd("sda2", "part", Some("ext4"), Some("/usr"))]);
+        app.list_state.select(Some(0));
+        let request = app.force_unmount_selected();
+        assert!(request.is_none());
+        assert!(matches!(app.action, ActionStatus::Error(_)));
+    }
+
+    #[test]
+    fn update_devices_ignores_an_identical_tree() {
+        let mut app = app_with(sample_tree());
+        assert!(!app.update_devices(sample_tree()));
+    }
+
+    #[test]
+    fn update_devices_replaces_a_changed_tree_and_keeps_selection() {
+        let mut app = app_with(sample_tree());
+        app.collapsed.insert("sda".to_string());
+        app.list_state.select(Some(2)); // sdb1 (sda's children are hidden)
+        assert_eq!(app.selected_device().unwrap().name, "sdb1");
+
+        let mut devices = vec![bd("sdc", "disk", None, None)];
+        devices.extend(sample_tree());
+
+        assert!(app.update_devices(devices));
+        assert_eq!(app.selected_device().unwrap().name, "sdb1");
+        assert!(app.is_collapsed("sda"));
+    }
+
+    #[test]
+    fn update_devices_detects_flag_and_mountpoint_changes() {
+        let mut app = app_with(vec![bd("sdb1", "part", Some("ext4"), None)]);
+        let mut changed = bd("sdb1", "part", Some("ext4"), Some("/mnt/a"));
+        assert!(app.update_devices(vec![changed.clone()]));
+        // Equal again: no redraw needed.
+        assert!(!app.update_devices(vec![changed.clone()]));
+
+        changed.ro = true;
+        assert!(app.update_devices(vec![changed]));
+    }
+
+    #[test]
+    fn unmounting_a_multi_mount_device_is_refused_without_commands() {
+        let mut app = app_with(vec![with_mounts(
+            bd("sdb1", "part", Some("ext4"), None),
+            &["/mnt/a", "/mnt/b"],
+        )]);
+        app.list_state.select(Some(0));
+
+        let runner = no_commands();
+        assert!(app.unmount_selected(&runner).is_none());
+        assert_eq!(runner.call_count(), 0);
+        match &app.action {
+            ActionStatus::Error(message) => {
+                assert!(message.contains("has 2 mount points"), "{}", message);
+                assert!(message.contains("unmount manually"), "{}", message);
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn force_unmounting_a_multi_mount_device_is_refused() {
+        let mut app = app_with(vec![with_mounts(
+            bd("sdb1", "part", Some("ext4"), None),
+            &["/mnt/a", "/mnt/b"],
+        )]);
+        app.list_state.select(Some(0));
+
+        assert!(app.force_unmount_selected().is_none());
+        match &app.action {
+            ActionStatus::Error(message) => {
+                assert!(message.contains("has 2 mount points"), "{}", message);
+                assert!(message.contains("unmount manually"), "{}", message);
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multi_mount_system_protection_checks_every_mountpoint() {
+        let mut app = app_with(vec![with_mounts(
+            bd("sda1", "part", Some("ext4"), None),
+            &["/mnt/data", "/"],
+        )]);
+        app.list_state.select(Some(0));
+
+        let runner = no_commands();
+        assert!(app.unmount_selected(&runner).is_none());
+        assert_eq!(runner.call_count(), 0);
+        match &app.action {
+            ActionStatus::Error(message) => {
+                assert!(message.contains("system mount"), "{}", message);
+                assert!(!message.contains("mount points;"), "{}", message);
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn already_mounted_error_lists_all_mountpoints() {
+        let mut app = app_with(vec![with_mounts(
+            bd("sdb1", "part", Some("ext4"), None),
+            &["/mnt/a", "/mnt/b"],
+        )]);
+        app.list_state.select(Some(0));
+
+        let runner = no_commands();
+        assert!(app.mount_selected(&runner).is_none());
+        assert_eq!(runner.call_count(), 0);
+        match &app.action {
+            ActionStatus::Error(message) => {
+                assert!(message.contains("/mnt/a"), "{}", message);
+                assert!(message.contains("/mnt/b"), "{}", message);
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unmounting_a_protected_subtree_is_refused() {
+        let mut app = app_with(vec![bd("sda1", "part", Some("ext4"), Some("/var/lib"))]);
+        app.list_state.select(Some(0));
+        let runner = no_commands();
+        assert!(app.unmount_selected(&runner).is_none());
+        assert_eq!(runner.call_count(), 0);
+        assert!(matches!(app.action, ActionStatus::Error(_)));
+    }
+
+    #[test]
+    fn enter_on_non_mountable_device_explains_why() {
+        let mut app = app_with(vec![bd("sdb1", "part", Some("LVM2_member"), None)]);
+        app.list_state.select(Some(0));
+        let runner = no_commands();
+        assert!(app.enter_selected(&runner).is_none());
+        assert_eq!(runner.call_count(), 0);
+        match &app.action {
+            ActionStatus::Error(message) => {
+                assert!(message.contains("sdb1"), "{}", message);
+                assert!(message.contains("LVM2_member"), "{}", message);
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mount_selected_rejects_non_filesystem() {
+        let mut app = app_with(vec![bd("sdb1", "part", Some("swap"), None)]);
+        app.list_state.select(Some(0));
+        let runner = no_commands();
+        assert!(app.mount_selected(&runner).is_none());
+        assert_eq!(runner.call_count(), 0);
+        assert!(matches!(app.action, ActionStatus::Error(_)));
+    }
+
+    #[test]
+    fn parses_udisksctl_mount_output() {
+        assert_eq!(
+            parse_udisks_mountpoint("Mounted /dev/sdb1 at /media/user/USB."),
+            Some("/media/user/USB".to_string())
+        );
+        assert_eq!(
+            parse_udisks_mountpoint("Mounted /dev/sdb1 at /media/user/My Disk"),
+            Some("/media/user/My Disk".to_string())
+        );
+        assert_eq!(parse_udisks_mountpoint("something else"), None);
+    }
+
+    #[test]
+    fn finish_status_reports_real_mountpoint() {
+        let request = InteractiveRequest {
+            program: "sudo".into(),
+            args: vec![
+                "mount".into(),
+                "/dev/sdb1".into(),
+                "/home/u/mnt/sdb1".into(),
+            ],
+            op: InteractiveOp::Mount,
+            device_name: "sdb1".into(),
+            context: "udisksctl: not authorized".into(),
+            fallback_args: None,
+        };
+        assert_eq!(
+            outcome_status(&request, true, Some("/media/u/USB".into())),
+            ActionStatus::Success("Mounted /dev/sdb1 at /media/u/USB".into())
+        );
+        assert_eq!(
+            outcome_status(&request, true, None),
+            ActionStatus::Success("Mounted /dev/sdb1 at ?".into())
+        );
+        match outcome_status(&request, false, None) {
+            ActionStatus::Error(message) => {
+                assert!(
+                    message.contains("Mount failed for /dev/sdb1"),
+                    "{}",
+                    message
+                );
+                assert!(message.contains("not authorized"), "{}", message);
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn finish_status_mentions_force_hint_only_when_busy() {
+        let mut request = InteractiveRequest {
+            program: "sudo".into(),
+            args: vec!["umount".into(), "/dev/sdb1".into()],
+            op: InteractiveOp::Unmount,
+            device_name: "sdb1".into(),
+            context: "udisksctl: target is busy".into(),
+            fallback_args: None,
+        };
+        match outcome_status(&request, false, None) {
+            ActionStatus::Error(message) => {
+                assert!(message.contains("Press 'f'"), "{}", message)
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
+        request.context = "udisksctl: permission denied".into();
+        match outcome_status(&request, false, None) {
+            ActionStatus::Error(message) => {
+                assert!(!message.contains("Press 'f'"), "{}", message)
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
+        assert_eq!(
+            outcome_status(&request, true, None),
+            ActionStatus::Success("Unmounted /dev/sdb1".into())
+        );
+    }
+
+    #[test]
+    fn finish_status_for_force_unmount() {
+        let request = InteractiveRequest {
+            program: "sudo".into(),
+            args: vec!["umount".into(), "-l".into(), "/dev/sdb1".into()],
+            op: InteractiveOp::ForceUnmount,
+            device_name: "sdb1".into(),
+            context: String::new(),
+            fallback_args: Some(vec!["umount".into(), "-l".into(), "/media/u/USB".into()]),
+        };
+        assert!(matches!(
+            outcome_status(&request, true, None),
+            ActionStatus::Success(_)
+        ));
+        assert!(matches!(
+            outcome_status(&request, false, None),
+            ActionStatus::Error(_)
+        ));
+    }
+
+    const UNMOUNTED_JSON: &str = r#"{"blockdevices":[{"name":"sdb1","size":"8G","type":"part","fstype":"vfat","mountpoint":null,"mountpoints":[null],"label":"USBKEY","ro":false,"rm":true,"model":null,"vendor":null,"tran":"usb","serial":null,"uuid":null}]}"#;
+
+    const MOUNTED_JSON: &str = r#"{"blockdevices":[{"name":"sdb1","size":"8G","type":"part","fstype":"vfat","mountpoint":"/media/u/USB","mountpoints":["/media/u/USB"],"label":"USBKEY","ro":false,"rm":true,"model":null,"vendor":null,"tran":"usb","serial":null,"uuid":null}]}"#;
+
+    #[test]
+    fn mount_success_reports_the_real_mountpoint() {
+        let runner = FakeRunner::new()
+            .push_ok("Mounted /dev/sdb1 at /media/u/USB.")
+            .push_ok(MOUNTED_JSON);
+
+        let mut app = app_with(vec![bd("sdb1", "part", Some("vfat"), None)]);
+        app.list_state.select(Some(0));
+
+        assert!(app.mount_selected(&runner).is_none());
+        assert_eq!(
+            app.action,
+            ActionStatus::Success("Mounted /dev/sdb1 at /media/u/USB".into())
+        );
+
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0],
+            CommandSpec::new("udisksctl", &["mount", "-b", "/dev/sdb1"])
+        );
+        assert_eq!(calls[1].program, "lsblk");
+
+        // The tree was reloaded, so the device now shows the real mount point.
+        assert!(disk::is_mounted(&app.selected_device().unwrap()));
+    }
+
+    #[test]
+    fn mount_failure_requests_sudo_with_stderr_as_context() {
+        with_temp_home(|home| {
+            let runner = FakeRunner::new().push_fail("Error: not authorized to mount /dev/sdb1");
+
+            let mut app = app_with(vec![bd("sdb1", "part", Some("vfat"), None)]);
+            app.list_state.select(Some(0));
+
+            let request = app.mount_selected(&runner).expect("sudo fallback request");
+            assert_eq!(request.program, "sudo");
+            assert_eq!(request.op, InteractiveOp::Mount);
+            assert_eq!(request.device_name, "sdb1");
+            assert_eq!(request.args[0], "mount");
+            assert_eq!(request.args[1], "/dev/sdb1");
+            assert_eq!(
+                request.args[2],
+                format!("{}/mnt/sdb1", home.display()),
+                "mount point must live under HOME"
+            );
+            assert!(
+                request.context.contains("not authorized"),
+                "{}",
+                request.context
+            );
+            assert_eq!(runner.call_count(), 1);
+        });
+    }
+
+    #[test]
+    fn mount_command_error_requests_sudo_with_io_error_context() {
+        with_temp_home(|_| {
+            let runner = FakeRunner::new().push_err("udisksctl not found");
+            let mut app = app_with(vec![bd("sdb1", "part", Some("vfat"), None)]);
+            app.list_state.select(Some(0));
+
+            let request = app.mount_selected(&runner).expect("sudo fallback request");
+            assert!(
+                request
+                    .context
+                    .contains("udisksctl error: udisksctl not found"),
+                "{}",
+                request.context
+            );
+        });
+    }
+
+    #[test]
+    fn unmount_busy_context_lists_the_processes() {
+        let runner = FakeRunner::new()
+            .push_fail("Error unmounting /dev/sdb1: target is busy (udisks-error-quark, 26)")
+            .push_ok("                     USER        PID ACCESS COMMAND\n/dev/sdb1:           root       1234 ..c.. bash");
+
+        let mut app = app_with(vec![with_mounts(
+            bd("sdb1", "part", Some("ext4"), None),
+            &["/mnt/data"],
+        )]);
+        app.list_state.select(Some(0));
+
+        let request = app
+            .unmount_selected(&runner)
+            .expect("sudo fallback request");
+        assert_eq!(request.op, InteractiveOp::Unmount);
+        assert_eq!(request.args, vec!["umount".to_string(), "/dev/sdb1".into()]);
+        assert!(request.context.contains("busy"), "{}", request.context);
+        assert!(request.context.contains("1234"), "{}", request.context);
+        assert_eq!(runner.call_count(), 2);
+
+        // The same context drives the "press f" hint after the interactive run.
+        match outcome_status(&request, false, None) {
+            ActionStatus::Error(message) => {
+                assert!(message.contains("Press 'f'"), "{}", message)
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unmount_failure_without_busy_skips_busy_diagnostics() {
+        let runner = FakeRunner::new().push_fail("Error: permission denied");
+
+        let mut app = app_with(vec![with_mounts(
+            bd("sdb1", "part", Some("ext4"), None),
+            &["/mnt/data"],
+        )]);
+        app.list_state.select(Some(0));
+
+        let request = app
+            .unmount_selected(&runner)
+            .expect("sudo fallback request");
+        assert_eq!(
+            request.context,
+            "udisksctl: Error: permission denied".to_string()
+        );
+        // Only udisksctl ran: fuser/lsof are not consulted when it is not busy.
+        assert_eq!(runner.call_count(), 1);
+    }
+
+    #[test]
+    fn unmount_success_reloads_the_tree() {
+        let runner = FakeRunner::new()
+            .push_ok("Unmounted /dev/sdb1.")
+            .push_ok(UNMOUNTED_JSON);
+
+        let mut app = app_with(vec![with_mounts(
+            bd("sdb1", "part", Some("vfat"), None),
+            &["/media/u/USB"],
+        )]);
+        app.list_state.select(Some(0));
+
+        assert!(app.unmount_selected(&runner).is_none());
+        assert_eq!(
+            app.action,
+            ActionStatus::Success("Unmounted /dev/sdb1".into())
+        );
+        assert!(!disk::is_mounted(&app.selected_device().unwrap()));
+        assert_eq!(runner.call_count(), 2);
+    }
+
+    #[test]
+    fn refresh_reports_failures_in_the_status_bar() {
+        let runner = FakeRunner::new()
+            .push_fail("lsblk: unknown column: MOUNTPOINTS")
+            .push_fail("lsblk: no devices");
+
+        let mut app = app_with(vec![bd("sda", "disk", None, None)]);
+        app.refresh(&runner);
+
+        match &app.action {
+            ActionStatus::Error(message) => {
+                assert!(message.starts_with("Refresh failed:"), "{}", message);
+                assert!(message.contains("lsblk: no devices"), "{}", message);
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
+        assert_eq!(runner.call_count(), 2);
+    }
+
+    #[test]
+    fn refresh_success_replaces_the_device_tree() {
+        let runner = FakeRunner::new().push_ok(MOUNTED_JSON);
+        let mut app = app_with(vec![bd("sda", "disk", None, None)]);
+
+        app.refresh(&runner);
+
+        assert_eq!(app.devices.len(), 1);
+        assert_eq!(app.devices[0].name, "sdb1");
+        assert!(matches!(app.action, ActionStatus::None));
+        assert_eq!(runner.call_count(), 1);
+    }
+
+    #[test]
+    fn auto_refresh_only_returns_true_when_the_tree_changed() {
+        let parse_runner = FakeRunner::new().push_ok(UNMOUNTED_JSON);
+        let devices = disk::get_block_devices(&parse_runner).unwrap();
+        let mut app = App::new(devices);
+
+        // Identical tree: no redraw.
+        let same = FakeRunner::new().push_ok(UNMOUNTED_JSON);
+        assert!(!app.auto_refresh(&same));
+
+        // The device got mounted in the meantime: redraw.
+        let changed = FakeRunner::new().push_ok(MOUNTED_JSON);
+        assert!(app.auto_refresh(&changed));
+        assert!(disk::is_mounted(&app.selected_device().unwrap()));
+
+        // Both lsblk attempts fail: stay silent and keep the old tree.
+        let failing = FakeRunner::new()
+            .push_fail("lsblk: unknown column: MOUNTPOINTS")
+            .push_fail("lsblk: no devices");
+        assert!(!app.auto_refresh(&failing));
+        assert!(disk::is_mounted(&app.selected_device().unwrap()));
+        assert!(matches!(app.action, ActionStatus::None));
+    }
+
+    #[test]
+    fn finish_uses_runner_to_report_the_real_mountpoint() {
+        let runner = FakeRunner::new().push_ok(MOUNTED_JSON);
+        let mut app = app_with(vec![bd("sdb1", "part", Some("vfat"), None)]);
+        let request = InteractiveRequest {
+            program: "sudo".into(),
+            args: vec![
+                "mount".into(),
+                "/dev/sdb1".into(),
+                "/home/u/mnt/sdb1".into(),
+            ],
+            op: InteractiveOp::Mount,
+            device_name: "sdb1".into(),
+            context: "udisksctl: not authorized".into(),
+            fallback_args: None,
+        };
+
+        app.finish(&runner, request, true);
+
+        assert_eq!(
+            app.action,
+            ActionStatus::Success("Mounted /dev/sdb1 at /media/u/USB".into())
+        );
+        assert_eq!(runner.call_count(), 1);
+    }
+
+    /// Redirect `HOME` to a scratch directory for the duration of `f`, so
+    /// `sudo_mount_request` never creates mount points in the real home.
+    ///
+    /// `HOME` is process-global, so the environment lock serialises every test
+    /// that uses this helper.
+    fn with_temp_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let home = std::env::temp_dir().join(format!(
+            "mount-tui-app-test-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+
+        let previous = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let result = f(&home);
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        result
+    }
+}

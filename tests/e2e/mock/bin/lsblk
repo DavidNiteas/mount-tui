@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Mock `lsblk` for tests/e2e (new-style output, includes MOUNTPOINTS).
+#
+# State (read from $MOCK_STATE, never from the repository):
+#   $MOCK_STATE/mounted  -> sdb1 is mounted at /media/e2e/USBKEY
+#   $MOCK_STATE/hotplug  -> an extra "sdhot" disk is plugged in
+set -u
+
+if [ -z "${MOCK_STATE:-}" ]; then
+    echo "mock lsblk: MOCK_STATE is not set" >&2
+    exit 1
+fi
+
+mp="null"
+if [ -f "$MOCK_STATE/mounted" ]; then
+    mp='"/media/e2e/USBKEY"'
+fi
+
+json='{"blockdevices":['
+if [ -f "$MOCK_STATE/hotplug" ]; then
+    json+='{"name":"sdhot","size":"32G","type":"disk","fstype":null,"mountpoints":[null],"label":null,"model":"HOTPLUG","vendor":null,"tran":"usb","serial":null,"uuid":null,"ro":false,"rm":true},'
+fi
+json+='{"name":"sda","size":"100G","type":"disk","fstype":null,"mountpoints":[null],"label":null,"model":"SYSDISK","vendor":"V","tran":"sata","serial":"S1","uuid":null,"ro":false,"rm":false,"children":['
+json+='{"name":"sda1","size":"100G","type":"part","fstype":"ext4","mountpoints":["/home"],"label":null,"model":null,"vendor":null,"tran":null,"serial":null,"uuid":"U1","ro":false,"rm":false}'
+json+=']},'
+json+='{"name":"sdb","size":"8G","type":"disk","fstype":null,"mountpoints":[null],"label":null,"model":"USBSTICK","vendor":"Generic","tran":"usb","serial":"S2","uuid":null,"ro":false,"rm":true,"children":['
+json+="{\"name\":\"sdb1\",\"size\":\"8G\",\"type\":\"part\",\"fstype\":\"vfat\",\"mountpoints\":[$mp],\"label\":\"USBKEY\",\"model\":null,\"vendor\":null,\"tran\":null,\"serial\":null,\"uuid\":\"ABCD-1234\",\"ro\":false,\"rm\":true}"
+json+=']},'
+json+='{"name":"sdc","size":"500G","type":"disk","fstype":null,"mountpoints":[null],"label":null,"model":null,"vendor":null,"tran":"sata","serial":null,"uuid":null,"ro":false,"rm":false,"children":['
+json+='{"name":"sdc1","size":"500G","type":"part","fstype":"LVM2_member","mountpoints":[null],"label":null,"model":null,"vendor":null,"tran":null,"serial":null,"uuid":null,"ro":false,"rm":false}'
+json+=']},'
+json+='{"name":"sdx","size":"2T","type":"disk","fstype":null,"mountpoints":[null],"label":null,"model":"HOME-DISK","vendor":null,"tran":"sata","serial":null,"uuid":null,"ro":false,"rm":false,"children":['
+json+='{"name":"sdx1","size":"2T","type":"part","fstype":"ext4","mountpoints":["/home/e2e"],"label":null,"model":null,"vendor":null,"tran":null,"serial":null,"uuid":null,"ro":false,"rm":false}'
+json+=']},'
+json+='{"name":"sdy","size":"1T","type":"disk","fstype":null,"mountpoints":[null],"label":null,"model":"MULTI-DISK","vendor":null,"tran":"sata","serial":null,"uuid":null,"ro":false,"rm":false,"children":['
+json+='{"name":"sdy1","size":"1T","type":"part","fstype":"ext4","mountpoints":["/mnt/multi1","/mnt/multi2"],"label":"MULTI","model":null,"vendor":null,"tran":null,"serial":null,"uuid":null,"ro":false,"rm":false}'
+json+=']},'
+json+='{"name":"sdw","size":"1T","type":"disk","fstype":null,"mountpoints":[null],"label":null,"model":"RO-DISK","vendor":null,"tran":"sata","serial":null,"uuid":null,"ro":true,"rm":false,"children":['
+json+='{"name":"sdw1","size":"1T","type":"part","fstype":"ext4","mountpoints":[null],"label":"RODISK","model":null,"vendor":null,"tran":null,"serial":null,"uuid":null,"ro":true,"rm":false}'
+json+=']},'
+for i in $(seq 1 25); do
+    json+="{\"name\":\"vd$i\",\"size\":\"16G\",\"type\":\"disk\",\"fstype\":null,\"mountpoints\":[null],\"label\":null,\"model\":\"SCROLL-$i\",\"vendor\":null,\"tran\":\"sata\",\"serial\":null,\"uuid\":null,\"ro\":false,\"rm\":false},"
+done
+json+='{"name":"sdz","size":"4G","type":"disk","fstype":null,"mountpoints":[null],"label":null,"model":"SUDO-TEST","vendor":null,"tran":"sata","serial":null,"uuid":null,"ro":false,"rm":false,"children":['
+json+='{"name":"sdz1","size":"4G","type":"part","fstype":"ext4","mountpoints":[null],"label":null,"model":null,"vendor":null,"tran":null,"serial":null,"uuid":null,"ro":false,"rm":false}'
+json+=']},'
+json="${json%,}"
+json+=']}'
+printf '%s\n' "$json"

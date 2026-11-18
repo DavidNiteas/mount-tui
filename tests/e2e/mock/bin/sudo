@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Mock `sudo` for tests/e2e: records the invocation, never succeeds.
+#
+# The safety scenarios assert that this file is never reached; the sudo-handoff
+# scenario asserts that it is.
+set -u
+
+if [ -z "${MOCK_STATE:-}" ]; then
+    echo "mock sudo: MOCK_STATE is not set" >&2
+    exit 1
+fi
+
+printf 'SUDO %s\n' "$*" >>"$MOCK_STATE/calls.log"
+echo "MOCK SUDO: refusing (simulated failure)" >&2
+exit 1

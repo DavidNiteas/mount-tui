@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Mock `udisksctl` for tests/e2e.
+#
+# Mounting / unmounting /dev/sdb1 succeeds (and flips $MOCK_STATE/mounted);
+# every other device is rejected with the long CJK "not authorized" error used
+# by the sudo-handoff scenario. Calls are appended to $MOCK_STATE/calls.log.
+set -u
+
+if [ -z "${MOCK_STATE:-}" ]; then
+    echo "mock udisksctl: MOCK_STATE is not set" >&2
+    exit 1
+fi
+
+printf 'udisksctl %s\n' "$*" >>"$MOCK_STATE/calls.log"
+
+if [ "${1:-}" = "mount" ] && [ "${3:-}" = "/dev/sdb1" ]; then
+    touch "$MOCK_STATE/mounted"
+    echo "Mounted /dev/sdb1 at /media/e2e/USBKEY."
+    exit 0
+fi
+if [ "${1:-}" = "unmount" ] && [ "${3:-}" = "/dev/sdb1" ]; then
+    rm -f "$MOCK_STATE/mounted"
+    echo "Unmounted /dev/sdb1."
+    exit 0
+fi
+
+printf '错误：当前会话没有权限对该块设备执行操作，需要交互式认证。%s END_OF_LONG_ERROR\n' \
+    '这是一个用于验证宽字符换行与状态栏动态高度的超长中文错误信息，包含卷标“我的U盘”与挂载路径 /media/e2e/我的U盘，重复内容用于确保显示宽度远超终端宽度并且尾部不应被裁剪。这是一个用于验证宽字符换行与状态栏动态高度的超长中文错误信息，包含卷标“我的U盘”与挂载路径 /media/e2e/我的U盘。' >&2
+exit 1

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Mock `lsof` for tests/e2e.
+#
+# Same contract as the `fuser` stub: record the call, report nothing, fail. The
+# e2e runs must never consult the real lsof for mock devices.
+set -u
+
+if [ -z "${MOCK_STATE:-}" ]; then
+    echo "mock lsof: MOCK_STATE is not set" >&2
+    exit 1
+fi
+
+printf 'lsof %s\n' "$*" >>"$MOCK_STATE/calls.log"
+# No open file matches the device path.
+exit 1

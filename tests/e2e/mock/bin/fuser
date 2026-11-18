@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Mock `fuser` for tests/e2e.
+#
+# The end-to-end scenarios never hit the busy branch, and a stub that reports
+# "no processes" keeps that path deterministic: a future busy scenario must not
+# reach the real fuser (and thereby the real kernel / real devices).
+set -u
+
+if [ -z "${MOCK_STATE:-}" ]; then
+    echo "mock fuser: MOCK_STATE is not set" >&2
+    exit 1
+fi
+
+printf 'fuser %s\n' "$*" >>"$MOCK_STATE/calls.log"
+# No process owns the device.
+exit 1
