@@ -16,6 +16,12 @@ if [ -f "$MOCK_STATE/mounted" ]; then
     mp='"/media/e2e/USBKEY"'
 fi
 
+# sudo-mode scenario: the mock sudo records where it "mounted" /dev/sdz1.
+sdz1_mp="null"
+if [ -f "$MOCK_STATE/sdz1_mp" ]; then
+    sdz1_mp="\"$(cat "$MOCK_STATE/sdz1_mp")\""
+fi
+
 json='{"blockdevices":['
 if [ -f "$MOCK_STATE/hotplug" ]; then
     json+='{"name":"sdhot","size":"32G","type":"disk","fstype":null,"mountpoints":[null],"label":null,"model":"HOTPLUG","vendor":null,"tran":"usb","serial":null,"uuid":null,"ro":false,"rm":true},'
@@ -42,7 +48,7 @@ for i in $(seq 1 25); do
     json+="{\"name\":\"vd$i\",\"size\":\"16G\",\"type\":\"disk\",\"fstype\":null,\"mountpoints\":[null],\"label\":null,\"model\":\"SCROLL-$i\",\"vendor\":null,\"tran\":\"sata\",\"serial\":null,\"uuid\":null,\"ro\":false,\"rm\":false},"
 done
 json+='{"name":"sdz","size":"4G","type":"disk","fstype":null,"mountpoints":[null],"label":null,"model":"SUDO-TEST","vendor":null,"tran":"sata","serial":null,"uuid":null,"ro":false,"rm":false,"children":['
-json+='{"name":"sdz1","size":"4G","type":"part","fstype":"ext4","mountpoints":[null],"label":null,"model":null,"vendor":null,"tran":null,"serial":null,"uuid":null,"ro":false,"rm":false}'
+json+='{"name":"sdz1","size":"4G","type":"part","fstype":"ext4","mountpoints":['"$sdz1_mp"'],"label":null,"model":null,"vendor":null,"tran":null,"serial":null,"uuid":null,"ro":false,"rm":false}'
 json+=']},'
 json="${json%,}"
 json+=']}'

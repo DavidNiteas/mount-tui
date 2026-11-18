@@ -45,7 +45,9 @@ e2e_init() {
     STATE="$TMP/state"
     HOME_DIR="$TMP/home"
     OUT="$TMP/out"
-    mkdir -p "$STATE" "$HOME_DIR/mnt" "$OUT"
+    # `$HOME_DIR/mnt` is deliberately *not* created: the default mode must never
+    # need it, and sudo mode has to create its own root.
+    mkdir -p "$STATE" "$HOME_DIR" "$OUT"
     : >"$STATE/calls.log"
     : >"$STATE/legacy.log"
 
@@ -61,6 +63,11 @@ e2e_cleanup() {
 
 # Start the TUI inside tmux. `$1` optionally prefixes PATH (used by the legacy
 # scenario to put the old-lsblk mock first).
+#
+# `MOUNT_TUI_MODE` / `MOUNT_TUI_MOUNT_ROOT` are forwarded when the scenario
+# exports them; otherwise the process starts with the built-in defaults. The
+# caller's own configuration is never inherited (HOME is redirected, and
+# XDG_CONFIG_HOME would point at a real config file).
 start_tui() {
     local path_prefix="${1:-}"
 
@@ -71,6 +78,11 @@ start_tui() {
 export PATH="${path_prefix:+$path_prefix:}$E2E_DIR/mock/bin:\$PATH"
 export HOME="$HOME_DIR"
 export MOCK_STATE="$STATE"
+unset XDG_CONFIG_HOME
+unset MOUNT_TUI_MODE
+unset MOUNT_TUI_MOUNT_ROOT
+${MOUNT_TUI_MODE:+export MOUNT_TUI_MODE="$MOUNT_TUI_MODE"}
+${MOUNT_TUI_MOUNT_ROOT:+export MOUNT_TUI_MOUNT_ROOT="$MOUNT_TUI_MOUNT_ROOT"}
 exec "$BIN"
 EOF
     chmod +x "$TMP/launch.sh"
@@ -116,6 +128,26 @@ check_count_at_least() { # name pattern minimum file
         echo "PASS: $1"
     else
         echo "FAIL: $1 (expected >= $3 '$2' lines in $4, got ${count:-0})"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+check_no_path() { # name path
+    CHECKS=$((CHECKS + 1))
+    if [ -e "$2" ] || [ -L "$2" ]; then
+        echo "FAIL: $1 ($2 must not exist)"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "PASS: $1"
+    fi
+}
+
+check_path() { # name directory
+    CHECKS=$((CHECKS + 1))
+    if [ -d "$2" ]; then
+        echo "PASS: $1"
+    else
+        echo "FAIL: $1 (missing directory $2)"
         FAILURES=$((FAILURES + 1))
     fi
 }

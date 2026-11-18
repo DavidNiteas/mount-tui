@@ -8,12 +8,28 @@
 状态栏按实际渲染行数自动增高（上限 8 行）：8 行以内的 CJK 长错误不会被截断，
 超过上限仍会裁剪。
 
+## 两种挂载模式
+
+| 模式 | 是否需要 root | 挂载点 | 副作用 |
+|---|---|---|---|
+| `udisksctl`（默认） | 否 | 由 udisks2 决定（通常 `/media/<user>/<label>`） | 不创建任何目录 |
+| `sudo`（显式开启） | 是 | 可配置的挂载根下，默认 `~/mnt/usb` | 目标目录只在执行前创建，失败/取消后清理 |
+
+默认模式不会提权、不会回退 `sudo`、不会创建目录；需要自定义挂载位置的人显式
+启用 sudo 模式。
+
+挂载根只在真正会被用到时才检查文件系统（是否为文件 / 符号链接 / 不可读）：
+`sudo` 模式，或 `root` 来自显式配置（命令行 / 环境变量 / 配置文件）。因此默认
+`udisksctl` 模式下，即使 `~/mnt/usb` 不存在、是文件或符号链接，也不会阻止启动；
+纯值校验（`~` 展开、相对路径、系统目录、`$HOME` 本身）在所有模式下照常执行。
+
 ## 依赖
 
 - Linux（读取 `/proc`/`lsblk` 的块设备信息）
 - `lsblk`（util-linux）；旧版本缺少 `MOUNTPOINTS` 列时会自动回退到旧列
-- `udisksctl`（udisks2）优先；不可用时回退到 `sudo mount` / `sudo umount`
-- `fuser` / `lsof`（可选）：卸载遇 `busy` 时用于列出占用进程
+- `udisksctl`（udisks2）：默认模式使用
+- `sudo`：仅 sudo 模式使用
+- `fuser` / `lsof`（可选）：默认模式卸载遇 `busy` 时用于列出占用进程
 - `tmux`：仅端到端测试需要
 
 ## 构建
@@ -23,18 +39,63 @@ cargo build
 ```
 
 产物：`target/debug/mount-tui`。Rust 依赖只有 ratatui / crossterm / serde /
-serde_json / anyhow；系统命令依赖见上一节。本仓库开发环境依赖已缓存，使用
-`--offline` 也可构建。
+serde_json / anyhow / toml；系统命令依赖见上一节。本仓库开发环境依赖已缓存，
+使用 `--offline` 也可构建。
 
 ## 运行
 
 ```bash
-./target/debug/mount-tui
+./target/debug/mount-tui                       # 默认 udisksctl 模式
+./target/debug/mount-tui --mount-mode sudo     # 显式 sudo 模式，默认根 ~/mnt/usb
+./target/debug/mount-tui --help
+./target/debug/mount-tui --version
 ```
 
-启动时先读取设备列表，读取失败会在 TUI 状态栏里显示原因，而不是直接退出。
-运行期出现无法恢复的错误（例如终端初始化失败）时，程序先恢复终端，再以**非零
-退出码**结束——脚本可以据此判断成败。
+启动时先读取配置与设备列表，读取失败会在 TUI 状态栏里显示原因，而不是直接退出；
+**配置错误**（未知模式、非法挂载根等）在进入 TUI 之前打印到 stderr 并以非零退出码
+结束。运行期出现无法恢复的错误（例如终端初始化失败）时，程序先恢复终端，再以
+**非零退出码**结束——脚本可以据此判断成败。
+
+## 配置
+
+配置文件：`$XDG_CONFIG_HOME/mount-tui/config.toml`，未设置 `$XDG_CONFIG_HOME`
+时为 `$HOME/.config/mount-tui/config.toml`。
+
+```toml
+[mount]
+mode = "udisksctl"   # 或 "sudo"
+root = "~/mnt/usb"   # 仅 sudo 模式使用
+```
+
+优先级（高到低）：命令行 `--mount-mode` / `--mount-root` > 环境变量
+`MOUNT_TUI_MODE` / `MOUNT_TUI_MOUNT_ROOT` > 配置文件 > 默认值
+（`udisksctl` + `~/mnt/usb`）。
+
+`root` 支持 `~`、`~/...` 与绝对路径；某一项为空或未写时用默认值。以下配置会被拒绝
+（stderr + 非零退出）：
+
+- `mode` 不是 `udisksctl` / `sudo`；
+- `root` 是相对路径，或使用了 `~user` 形式；
+- `root` 精确等于系统目录：`/`、`/boot`、`/etc`、`/usr`、`/var`、`/home`、`/root`、
+  `/opt`、`/srv`、`/mnt`、`/media`、`/tmp`、`/run`、`/proc`、`/sys`、`/dev`
+  （末尾 `/` 同样拒绝；子路径如 `/srv/usb`、`/mnt/data/usb` 允许）；
+- `root` 等于当前 `$HOME` 本身；
+- `root` 指向一个文件或符号链接（仅 `sudo` 模式或显式配置的 `root` 会检查）。
+
+自定义挂载根的例子：
+
+```toml
+[mount]
+mode = "sudo"
+root = "/srv/usb"
+```
+
+临时覆盖（不写配置文件）：
+
+```bash
+MOUNT_TUI_MODE=sudo MOUNT_TUI_MOUNT_ROOT=/srv/usb ./target/debug/mount-tui
+./target/debug/mount-tui --mount-mode sudo --mount-root /srv/usb
+```
 
 ## 键位
 
@@ -47,27 +108,48 @@ serde_json / anyhow；系统命令依赖见上一节。本仓库开发环境依�
 | `Enter` | 未挂载则挂载，已挂载则卸载；不可挂载时说明原因 |
 | `m` | 挂载选中设备 |
 | `u` | 卸载选中设备 |
-| `f` | 强制惰性卸载（`umount -l`）：第一次按下只提示确认，同一设备再按一次才执行 |
+| `f` | 强制卸载：第一次按下只提示确认，同一设备再按一次才执行 |
 | `r` | 立即刷新设备列表 |
 | `q` / `Esc` / `Ctrl-C` | 退出 |
 
-挂载优先调用 `udisksctl mount -b /dev/X`；失败时把终端让给 shell，执行
-`sudo mount -o nosuid,nodev /dev/X $HOME/mnt/X`（挂载点由本程序创建），完成后按
-Enter 返回 TUI，状态栏按真实挂载点报告结果。`nosuid,nodev` 防止外来文件系统
-在主机上生效 setuid 二进制或设备节点；`udisksctl` 路径的挂载选项由 udisks2 决定。
-卸载同理：`udisksctl unmount` 失败后交接 `sudo umount`。
+## 挂载与卸载
+
+| 动作 | `udisksctl`（默认） | `sudo`（opt-in） |
+|---|---|---|
+| 挂载 | `udisksctl mount -b /dev/X`；成功后在状态栏报告真实挂载点 | `sudo mount -o <options> /dev/X <root>/<label-or-name>`，交接终端 |
+| 卸载 | `udisksctl unmount -b /dev/X`；`busy` 时列出占用进程并提示 `f` | `sudo umount /dev/X`，交接终端 |
+| 强制卸载 | 二次确认后 `udisksctl unmount -b /dev/X -f`（不中断界面） | 二次确认后 `sudo umount -l /dev/X`（交接终端） |
+| 失败 | 只在状态栏报错，**不提权、不创建目录** | 状态栏报错；本次新建的目标目录（为空）被删除 |
+
+sudo 模式的挂载点和选项：
+
+- **名字**：有卷标用卷标（去掉首尾空白，`/`、`\` 与控制字符替换为 `_`，空 / `.` /
+  `..` 回退到设备名），无卷标用设备名（如 `sdb1`）；
+- **冲突**：目标已存在时，空目录直接复用；非空目录、普通文件、别的设备的挂载点
+  依次尝试 `<base>-<name>`、`<base>-2`、`<base>-3`…；**符号链接直接拒绝**；
+- **创建与清理**：目标目录只在交接终端前一刻创建；本次新建且挂载失败/取消时，
+  若目录仍为空则删除。挂载根本身不在启动时创建，默认模式完全不涉及目录；
+- **选项**：基础 `nosuid,nodev`（防止外来文件系统在主机上生效 setuid 二进制或设备
+  节点）；`vfat` / `exfat` / `ntfs` / `ntfs3` / `iso9660` 追加
+  `uid=<uid>,gid=<gid>,umask=0022`（取当前用户 `$HOME` 的属主，让这些文件系统对
+  普通用户可写）。udisksctl 模式的挂载选项由 udisks2 决定。
+
+**sudo 模式的代价**：每次挂载/卸载都要让出终端输密码；挂载点固定在配置的根目录
+下，不会出现在 `/media`；也没有 udisks2 的设备授权与自动命名。
 
 ## 强制卸载
 
-`f` 是破坏性操作（`umount -l` 只是把挂载点从命名空间摘掉，仍占用设备的进程在
-退出前可能继续写入，存在丢数据风险），因此需要**二次确认**：
+`f` 是破坏性操作（强制卸载只是把挂载点从命名空间摘掉，仍占用设备的进程在退出前
+可能继续写入，存在丢数据风险），因此需要**二次确认**：
 
 - 第一次 `f` 先做与 `u` 相同的前置检查（已挂载 / 非系统盘 / 单挂载点），通过后
   状态栏提示 `Press f again to force-unmount <name> (lazy unmount may lose data)`，
   此时不会执行任何命令；
 - 同一设备再按一次 `f` 才真正执行；中途移动选择、翻页、折叠、`m` / `u` / `Enter`
   或 `r` 刷新都会取消这次确认，提示也随之消失；
-- 前置检查不通过时第一次即拒绝，不会进入等待确认状态。
+- 前置检查不通过时第一次即拒绝，不会进入等待确认状态；
+- 实际命令随模式不同：默认模式 `udisksctl unmount -b <dev> -f`（不需要 sudo，界面
+  不中断），sudo 模式 `sudo umount -l <dev>`（失败时再对挂载点重试一次）。
 
 ## 系统盘保护
 
@@ -79,7 +161,7 @@ Enter 返回 TUI，状态栏按真实挂载点报告结果。`nosuid,nodev` 防�
    - 精确匹配：`/`、`/boot`、`/home`、`/usr`、`/var`、`/etc`、`/opt`、`/root`、`/srv`、`/tmp`；
    - 前缀匹配：`/boot/`、`/usr/`、`/var/`、`/etc/`、`/opt/`、`/srv/`；
    - `/home/<user>`（恰好两段）视为用户主目录，同样保护；
-   - `$HOME/mnt/<name>` 这类更深路径不受保护（本程序的挂载点要能卸）。
+   - 挂载根之下的路径（如 `~/mnt/usb/<name>`）不受保护（本程序的挂载点要能卸）。
 3. 多个挂载点（bind mount 等）只允许人工处理，见下节。
 
 ## 多挂载行为
@@ -102,25 +184,32 @@ Enter 返回 TUI，状态栏按真实挂载点报告结果。`nosuid,nodev` 防�
 
 ## 测试
 
-单元测试（不触发真实系统命令，全部走注入的 fake runner）：
+单元测试（不触发真实系统命令，全部走注入的 fake runner；挂载点/配置文件都用临时
+目录，不碰真实 `$HOME`）：
 
 ```bash
 cargo test
 ```
 
-端到端回归（mock `lsblk`/`udisksctl`/`sudo` + `tmux`，状态写在临时目录，不碰真实设备）：
+端到端回归（mock `lsblk`/`udisksctl`/`sudo` + `tmux`，状态写在临时目录，不碰真实
+设备）：
 
 ```bash
 cargo build
 tests/e2e/run-all.sh
 ```
 
-覆盖系统盘保护、多挂载拒绝、USB 挂载真实挂载点、LVM 成员提示、滚动、标签、
-热插拔自动刷新、旧版 `lsblk` 回退、`sudo` 终端交接与 CJK 长错误尾部。详见
-[`tests/e2e/README.md`](tests/e2e/README.md)。
+覆盖系统盘保护、多挂载拒绝、USB 挂载真实挂载点、LVM 成员提示、滚动、标签、热插拔
+自动刷新、旧版 `lsblk` 回退、默认模式失败不提权不建目录、sudo 模式的目标/选项/
+失败清理与成功报告。详见 [`tests/e2e/README.md`](tests/e2e/README.md)。
 
 ## 已知限制
 
+- **udisksctl 模式的挂载点不可配置**：`udisksctl mount` 不支持指定目标目录，挂载点
+  由 udisks2 决定；想要固定位置只能用 sudo 模式。
+- **sudo 模式需要交互认证**：每次挂载/卸载都要输密码，无法在无人值守场景使用。
+- **旧目录不自动清理**：更早的版本会在 `$HOME/mnt/<name>` 建空目录，升级后不会主动
+  删除，需要时自行 `rmdir`。
 - **旧版 `lsblk` 的多挂载盲区**：缺少 `MOUNTPOINTS` 列时只能读到单个
   `MOUNTPOINT`，因此「多挂载点拒绝」在该环境下无法触发（保护降级为单点判断）。
 - **真实 `sudo` / 热插拔仍需人工验证**：自动化只用 mock，真实 udisks2 行为、

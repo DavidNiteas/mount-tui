@@ -1,16 +1,15 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use ratatui::widgets::ListState;
 
+use crate::config::{Config, MountMode};
 use crate::disk::{self, BlockDevice};
+use crate::mount;
 use crate::runner::{CommandRunner, CommandSpec};
 
 /// Number of rows jumped by PageUp / PageDown.
 const PAGE_STEP: usize = 10;
-
-/// Mount options added to the `sudo mount` fallback: a removable / untrusted
-/// filesystem must never expose setuid binaries or device nodes on the host.
-const SAFE_MOUNT_OPTIONS: &str = "nosuid,nodev";
 
 /// Prefix of the status line asking for the second `f` press. [`App::clear_force_confirm`]
 /// uses it to remove the prompt again when the pending confirmation is dropped.
@@ -56,10 +55,15 @@ pub struct InteractiveRequest {
     pub context: String,
     /// Optional second attempt, used by force unmount (device path → mount point).
     pub fallback_args: Option<Vec<String>>,
+    /// Directory `main` has to create right before handing the terminal over
+    /// (sudo mode only). The App only describes it, it never creates anything.
+    pub mount_target: Option<PathBuf>,
 }
 
 pub struct App {
     pub devices: Vec<BlockDevice>,
+    /// Effective mount configuration (mode + root) loaded at startup.
+    pub config: Config,
     /// Collapsed device names (not indices) so the state survives refreshes.
     pub collapsed: HashSet<String>,
     pub list_state: ListState,
@@ -71,9 +75,19 @@ pub struct App {
 }
 
 impl App {
+    /// Build an app with the default configuration (udisksctl mode).
+    ///
+    /// Only the unit tests build an app without a loaded configuration; the
+    /// real entry point always goes through [`App::with_config`].
+    #[cfg(test)]
     pub fn new(devices: Vec<BlockDevice>) -> Self {
+        Self::with_config(devices, Config::default())
+    }
+
+    pub fn with_config(devices: Vec<BlockDevice>, config: Config) -> Self {
         let mut app = Self {
             devices,
+            config,
             collapsed: HashSet::new(),
             list_state: ListState::default(),
             action: ActionStatus::None,
@@ -255,7 +269,13 @@ impl App {
         }
     }
 
-    /// Mount the selected device (udisksctl first, sudo mount as fallback).
+    /// Mount the selected device with the configured backend.
+    ///
+    /// * udisksctl (default): `udisksctl mount -b <dev>` only. A failure is
+    ///   reported as an error: no sudo escalation, no directory creation.
+    /// * sudo (opt-in): the request describes `sudo mount -o … <dev> <target>`
+    ///   where `<target>` lives under the configured root; `main` creates it
+    ///   right before the terminal handoff.
     pub fn mount_selected(&mut self, runner: &dyn CommandRunner) -> Option<InteractiveRequest> {
         self.clear_force_confirm();
         let Some(device) = self.selected_device() else {
@@ -280,6 +300,17 @@ impl App {
 
         self.action = ActionStatus::Mounting;
 
+        match self.config.mount_mode {
+            MountMode::Udisksctl => {
+                self.mount_with_udisksctl(runner, &device);
+                None
+            }
+            MountMode::Sudo => self.sudo_mount_request(device),
+        }
+    }
+
+    /// Unprivileged mount: udisks2 picks the mount point itself.
+    fn mount_with_udisksctl(&mut self, runner: &dyn CommandRunner, device: &BlockDevice) {
         let dev_path = disk::device_path(&device.name);
 
         match runner.output(&CommandSpec::new(
@@ -297,46 +328,49 @@ impl App {
                     dev_path,
                     mount_point.unwrap_or_else(|| "?".into())
                 ));
-                None
             }
             Ok(output) => {
-                // Only the sudo path needs a local mount point; udisksctl picks
-                // /media/<user>/<label> itself.
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                self.sudo_mount_request(device, stderr)
+                self.action = ActionStatus::Error(mount_failed_message(&dev_path, &stderr));
             }
-            Err(e) => self.sudo_mount_request(device, format!("udisksctl error: {}", e)),
+            Err(error) => {
+                self.action = ActionStatus::Error(mount_failed_message(
+                    &dev_path,
+                    &format!("udisksctl error: {}", error),
+                ));
+            }
         }
     }
 
-    /// Build the interactive `sudo mount` fallback (mount point created here only).
-    fn sudo_mount_request(
-        &mut self,
-        device: BlockDevice,
-        context: String,
-    ) -> Option<InteractiveRequest> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let mount_point = format!("{}/mnt/{}", home, device.name);
-        if let Err(e) = std::fs::create_dir_all(&mount_point) {
-            self.action = ActionStatus::Error(format!(
-                "Failed to create mount point {}: {}",
-                mount_point, e
-            ));
-            return None;
-        }
+    /// Build the interactive `sudo mount` request.
+    ///
+    /// The mount point is *chosen* here (conflict-free under the configured
+    /// root) but never created: that happens in `main` immediately before the
+    /// handoff, so a cancelled or failed mount leaves no directory behind.
+    fn sudo_mount_request(&mut self, device: BlockDevice) -> Option<InteractiveRequest> {
+        let dev_path = disk::device_path(&device.name);
+        let target = match mount::resolve_target(&self.config.mount_root, &device) {
+            Ok(target) => target,
+            Err(error) => {
+                self.action = ActionStatus::Error(format!("Cannot mount {}: {}", dev_path, error));
+                return None;
+            }
+        };
+        let options = mount::mount_options(&device, mount::home_owner());
         Some(InteractiveRequest {
             program: "sudo".into(),
             args: vec![
                 "mount".into(),
                 "-o".into(),
-                SAFE_MOUNT_OPTIONS.into(),
-                disk::device_path(&device.name),
-                mount_point,
+                options,
+                dev_path,
+                target.display().to_string(),
             ],
             op: InteractiveOp::Mount,
             device_name: device.name,
-            context,
+            context: String::new(),
             fallback_args: None,
+            mount_target: Some(target),
         })
     }
 
@@ -392,7 +426,11 @@ impl App {
         true
     }
 
-    /// Unmount the selected device (udisksctl first, sudo umount as fallback).
+    /// Unmount the selected device with the configured backend.
+    ///
+    /// udisksctl (default): `udisksctl unmount -b <dev>` only, a failure is
+    /// reported as an error (busy devices still list their processes).
+    /// sudo (opt-in): an interactive `sudo umount <dev>` request.
     pub fn unmount_selected(&mut self, runner: &dyn CommandRunner) -> Option<InteractiveRequest> {
         self.clear_force_confirm();
         let Some(device) = self.selected_device() else {
@@ -406,6 +444,25 @@ impl App {
 
         self.action = ActionStatus::Unmounting;
 
+        match self.config.mount_mode {
+            MountMode::Udisksctl => {
+                self.unmount_with_udisksctl(runner, &device);
+                None
+            }
+            MountMode::Sudo => Some(InteractiveRequest {
+                program: "sudo".into(),
+                args: vec!["umount".into(), disk::device_path(&device.name)],
+                op: InteractiveOp::Unmount,
+                device_name: device.name,
+                context: String::new(),
+                fallback_args: None,
+                mount_target: None,
+            }),
+        }
+    }
+
+    /// Unprivileged unmount: udisks2 detaches the mount point itself.
+    fn unmount_with_udisksctl(&mut self, runner: &dyn CommandRunner, device: &BlockDevice) {
         let dev_path = disk::device_path(&device.name);
 
         match runner.output(&CommandSpec::new(
@@ -415,50 +472,52 @@ impl App {
             Ok(output) if output.success => {
                 let _ = self.reload_devices(runner);
                 self.action = ActionStatus::Success(format!("Unmounted {}", dev_path));
-                None
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                self.sudo_unmount_request(runner, device, stderr)
+                let context = self.describe_unmount_failure(runner, &dev_path, stderr);
+                self.action = ActionStatus::Error(unmount_failed_message(&dev_path, &context));
             }
-            Err(e) => self.sudo_unmount_request(runner, device, format!("udisksctl error: {}", e)),
+            Err(error) => {
+                self.action = ActionStatus::Error(unmount_failed_message(
+                    &dev_path,
+                    &format!("udisksctl error: {}", error),
+                ));
+            }
         }
     }
 
-    /// Build the interactive `sudo umount` fallback.
-    fn sudo_unmount_request(
-        &mut self,
+    /// Add the busy diagnostics to a failed unmount, if the device is busy.
+    fn describe_unmount_failure(
+        &self,
         runner: &dyn CommandRunner,
-        device: BlockDevice,
+        dev_path: &str,
         stderr: String,
-    ) -> Option<InteractiveRequest> {
-        let dev_path = disk::device_path(&device.name);
-        let is_busy = stderr.to_lowercase().contains("busy");
-        let mut context = format!("udisksctl: {}", stderr);
-        if is_busy {
-            let busy_info = Self::find_busy_processes(runner, &dev_path);
+    ) -> String {
+        let mut context = stderr;
+        if context.to_lowercase().contains("busy") {
+            let busy_info = Self::find_busy_processes(runner, dev_path);
             if busy_info.is_empty() {
                 context.push_str(" (device busy)");
             } else {
                 context.push_str(&format!(" busy: {}", busy_info.trim()));
             }
         }
-        Some(InteractiveRequest {
-            program: "sudo".into(),
-            args: vec!["umount".into(), dev_path],
-            op: InteractiveOp::Unmount,
-            device_name: device.name,
-            context,
-            fallback_args: None,
-        })
+        context
     }
 
-    /// Force lazy unmount; falls back from the device path to the mount point.
+    /// Force unmount; the exact command depends on the configured mode.
     ///
-    /// Two presses are required: the first one runs the full pre-check and only
-    /// arms the confirmation, the second one on the same device issues the
-    /// request. Navigation and any other operation cancel the pending state.
-    pub fn force_unmount_selected(&mut self) -> Option<InteractiveRequest> {
+    /// Two presses are always required: the first one runs the full pre-check
+    /// and only arms the confirmation, the second one on the same device issues
+    /// the command. Navigation and any other operation cancel the pending state.
+    ///
+    /// udisksctl mode runs `udisksctl unmount -b <dev> -f` through the runner
+    /// (no terminal handoff); sudo mode returns the `sudo umount -l` request.
+    pub fn force_unmount_selected(
+        &mut self,
+        runner: &dyn CommandRunner,
+    ) -> Option<InteractiveRequest> {
         let Some(device) = self.selected_device() else {
             self.clear_force_confirm();
             self.action = ActionStatus::Error("No device selected".into());
@@ -485,22 +544,54 @@ impl App {
         }
         self.action = ActionStatus::Unmounting;
 
-        let dev_path = disk::device_path(&device.name);
-        let mount_point = device.mountpoints.first().cloned().unwrap_or_default();
-        let fallback_args = if mount_point.is_empty() {
-            None
-        } else {
-            Some(vec!["umount".to_string(), "-l".to_string(), mount_point])
-        };
+        match self.config.mount_mode {
+            MountMode::Udisksctl => {
+                self.force_unmount_with_udisksctl(runner, &device);
+                None
+            }
+            MountMode::Sudo => {
+                let dev_path = disk::device_path(&device.name);
+                let mount_point = device.mountpoints.first().cloned().unwrap_or_default();
+                let fallback_args = if mount_point.is_empty() {
+                    None
+                } else {
+                    Some(vec!["umount".to_string(), "-l".to_string(), mount_point])
+                };
+                Some(InteractiveRequest {
+                    program: "sudo".into(),
+                    args: vec!["umount".into(), "-l".into(), dev_path],
+                    op: InteractiveOp::ForceUnmount,
+                    device_name: device.name,
+                    context: String::new(),
+                    fallback_args,
+                    mount_target: None,
+                })
+            }
+        }
+    }
 
-        Some(InteractiveRequest {
-            program: "sudo".into(),
-            args: vec!["umount".into(), "-l".into(), dev_path],
-            op: InteractiveOp::ForceUnmount,
-            device_name: device.name,
-            context: String::new(),
-            fallback_args,
-        })
+    /// Unprivileged forced unmount (`udisksctl unmount -f`).
+    fn force_unmount_with_udisksctl(&mut self, runner: &dyn CommandRunner, device: &BlockDevice) {
+        let dev_path = disk::device_path(&device.name);
+        match runner.output(&CommandSpec::new(
+            "udisksctl",
+            &["unmount", "-b", dev_path.as_str(), "-f"],
+        )) {
+            Ok(output) if output.success => {
+                let _ = self.reload_devices(runner);
+                self.action = force_unmount_success(&dev_path);
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                self.action = ActionStatus::Error(force_unmount_failed(&dev_path, &stderr));
+            }
+            Err(error) => {
+                self.action = ActionStatus::Error(force_unmount_failed(
+                    &dev_path,
+                    &format!("udisksctl error: {}", error),
+                ));
+            }
+        }
     }
 
     /// Drop a pending force-unmount confirmation. When the status bar still
@@ -625,6 +716,32 @@ fn parse_udisks_mountpoint(stdout: &str) -> Option<String> {
     }
 }
 
+/// Status text for a failed `mount`.
+fn mount_failed_message(dev_path: &str, context: &str) -> String {
+    format!("Mount failed for {}: {}", dev_path, context)
+}
+
+/// Status text for a failed `unmount`, with the force hint when busy.
+fn unmount_failed_message(dev_path: &str, context: &str) -> String {
+    let hint = if context.to_lowercase().contains("busy") {
+        "\nDevice busy. Press 'f' for force lazy unmount."
+    } else {
+        ""
+    };
+    format!("Unmount failed for {}: {}{}", dev_path, context, hint)
+}
+
+fn force_unmount_success(dev_path: &str) -> ActionStatus {
+    ActionStatus::Success(format!(
+        "Force unmounted {} (lazy: detached, cleaned up when no longer busy)",
+        dev_path
+    ))
+}
+
+fn force_unmount_failed(dev_path: &str, context: &str) -> String {
+    format!("Force unmount failed for {}: {}", dev_path, context)
+}
+
 /// Status bar text for a finished interactive operation.
 fn outcome_status(
     request: &InteractiveRequest,
@@ -638,30 +755,17 @@ fn outcome_status(
             dev_path,
             mount_point.unwrap_or_else(|| "?".into())
         )),
-        (InteractiveOp::Mount, false) => ActionStatus::Error(format!(
-            "Mount failed for {}: {}",
-            dev_path, request.context
-        )),
+        (InteractiveOp::Mount, false) => {
+            ActionStatus::Error(mount_failed_message(&dev_path, &request.context))
+        }
         (InteractiveOp::Unmount, true) => ActionStatus::Success(format!("Unmounted {}", dev_path)),
         (InteractiveOp::Unmount, false) => {
-            let hint = if request.context.to_lowercase().contains("busy") {
-                "\nDevice busy. Press 'f' for force lazy unmount."
-            } else {
-                ""
-            };
-            ActionStatus::Error(format!(
-                "Unmount failed for {}: {}{}",
-                dev_path, request.context, hint
-            ))
+            ActionStatus::Error(unmount_failed_message(&dev_path, &request.context))
         }
-        (InteractiveOp::ForceUnmount, true) => ActionStatus::Success(format!(
-            "Force unmounted {} (lazy: detached, cleaned up when no longer busy)",
-            dev_path
-        )),
-        (InteractiveOp::ForceUnmount, false) => ActionStatus::Error(format!(
-            "Force unmount failed for {}: {}",
-            dev_path, request.context
-        )),
+        (InteractiveOp::ForceUnmount, true) => force_unmount_success(&dev_path),
+        (InteractiveOp::ForceUnmount, false) => {
+            ActionStatus::Error(force_unmount_failed(&dev_path, &request.context))
+        }
     }
 }
 
@@ -669,6 +773,7 @@ fn outcome_status(
 mod tests {
     use super::*;
     use crate::runner::fake::FakeRunner;
+    use std::path::Path;
 
     fn bd(name: &str, device_type: &str, fstype: Option<&str>, mp: Option<&str>) -> BlockDevice {
         BlockDevice {
@@ -727,6 +832,57 @@ mod tests {
     /// asserting zero calls also proves that no command was attempted.
     fn no_commands() -> FakeRunner {
         FakeRunner::new()
+    }
+
+    /// Scratch directory for sudo-mode tests; removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let path = std::env::temp_dir().join(format!(
+                "mount-tui-app-{}-{}-{}",
+                tag,
+                std::process::id(),
+                unique
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Sudo-mode app whose root is a scratch directory (never the real HOME).
+    fn sudo_app(devices: Vec<BlockDevice>, root: &Path) -> App {
+        App::with_config(
+            devices,
+            Config {
+                mount_mode: MountMode::Sudo,
+                mount_root: root.to_path_buf(),
+            },
+        )
+    }
+
+    /// Mount options expected for a filesystem with a single-owner mapping when
+    /// the owner is the current user's `$HOME` directory.
+    fn expected_owner_options(home: &Path) -> String {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(home).unwrap();
+        format!(
+            "nosuid,nodev,uid={},gid={},umask=0022",
+            metadata.uid(),
+            metadata.gid()
+        )
     }
 
     #[test]
@@ -871,9 +1027,11 @@ mod tests {
     fn force_unmounting_a_system_mount_is_refused() {
         let mut app = app_with(vec![bd("sda2", "part", Some("ext4"), Some("/usr"))]);
         app.list_state.select(Some(0));
-        let request = app.force_unmount_selected();
+        let runner = no_commands();
+        let request = app.force_unmount_selected(&runner);
         assert!(request.is_none());
         assert!(matches!(app.action, ActionStatus::Error(_)));
+        assert_eq!(runner.call_count(), 0);
     }
 
     #[test]
@@ -937,7 +1095,7 @@ mod tests {
         )]);
         app.list_state.select(Some(0));
 
-        assert!(app.force_unmount_selected().is_none());
+        assert!(app.force_unmount_selected(&no_commands()).is_none());
         match &app.action {
             ActionStatus::Error(message) => {
                 assert!(message.contains("has 2 mount points"), "{}", message);
@@ -957,6 +1115,19 @@ mod tests {
         app
     }
 
+    /// The same device in sudo mode: the second `f` produces a request.
+    fn sudo_forceable_app(root: &Path) -> App {
+        let mut app = sudo_app(
+            vec![with_mounts(
+                bd("sdb1", "part", Some("ext4"), None),
+                &["/mnt/data"],
+            )],
+            root,
+        );
+        app.list_state.select(Some(0));
+        app
+    }
+
     fn force_prompt_shown(app: &App) -> bool {
         match &app.action {
             ActionStatus::Success(message) | ActionStatus::Error(message) => {
@@ -968,10 +1139,12 @@ mod tests {
 
     #[test]
     fn force_unmount_arms_on_the_first_press_and_runs_on_the_second() {
-        let mut app = forceable_app();
+        let root = TempDir::new("force-sudo");
+        let mut app = sudo_forceable_app(root.path());
+        let runner = no_commands();
 
         // First `f`: pre-check passes, the confirmation is armed, nothing runs.
-        assert!(app.force_unmount_selected().is_none());
+        assert!(app.force_unmount_selected(&runner).is_none());
         assert_eq!(app.force_confirm.as_deref(), Some("sdb1"));
         match &app.action {
             ActionStatus::Error(message) => {
@@ -988,10 +1161,11 @@ mod tests {
             }
             other => panic!("expected the confirmation prompt, got {:?}", other),
         }
+        assert_eq!(runner.call_count(), 0, "arming must not run anything");
 
         // Second `f` on the same device issues the real request.
         let request = app
-            .force_unmount_selected()
+            .force_unmount_selected(&runner)
             .expect("second press issues the request");
         assert_eq!(request.op, InteractiveOp::ForceUnmount);
         assert_eq!(
@@ -1002,7 +1176,59 @@ mod tests {
             request.fallback_args,
             Some(vec!["umount".to_string(), "-l".into(), "/mnt/data".into()])
         );
+        assert_eq!(request.mount_target, None);
         assert_eq!(app.force_confirm, None);
+        assert_eq!(runner.call_count(), 0, "sudo mode never touches the runner");
+    }
+
+    #[test]
+    fn udisksctl_force_runs_the_forced_unmount_through_the_runner() {
+        let runner = FakeRunner::new()
+            .push_ok("Unmounted /dev/sdb1.")
+            .push_ok(MOUNTED_JSON);
+        let mut app = forceable_app();
+
+        assert!(
+            app.force_unmount_selected(&runner).is_none(),
+            "first press arms"
+        );
+        assert!(
+            app.force_unmount_selected(&runner).is_none(),
+            "second press runs"
+        );
+        assert_eq!(
+            runner.calls()[0],
+            CommandSpec::new("udisksctl", &["unmount", "-b", "/dev/sdb1", "-f"]),
+            "udisksctl mode uses the non-interactive forced unmount"
+        );
+        assert_eq!(runner.call_count(), 2, "the tree is reloaded afterwards");
+        assert_eq!(app.force_confirm, None);
+        assert!(
+            matches!(&app.action, ActionStatus::Success(message) if message.contains("Force unmounted /dev/sdb1")),
+            "{:?}",
+            app.action
+        );
+    }
+
+    #[test]
+    fn udisksctl_force_failure_is_reported_without_sudo() {
+        let runner = FakeRunner::new().push_fail("Error: device is busy");
+        let mut app = forceable_app();
+
+        assert!(app.force_unmount_selected(&runner).is_none());
+        assert!(app.force_unmount_selected(&runner).is_none());
+        assert_eq!(runner.call_count(), 1, "no retry, no sudo fallback");
+        match &app.action {
+            ActionStatus::Error(message) => {
+                assert!(
+                    message.contains("Force unmount failed for /dev/sdb1"),
+                    "{}",
+                    message
+                );
+                assert!(message.contains("busy"), "{}", message);
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
     }
 
     #[test]
@@ -1019,7 +1245,7 @@ mod tests {
 
         for navigate in navigations {
             let mut app = forceable_app();
-            app.force_unmount_selected();
+            app.force_unmount_selected(&no_commands());
             assert!(app.force_confirm.is_some());
             assert!(force_prompt_shown(&app));
 
@@ -1041,7 +1267,7 @@ mod tests {
     fn other_operations_cancel_the_force_confirmation() {
         // `u` on the armed device.
         let mut app = forceable_app();
-        app.force_unmount_selected();
+        app.force_unmount_selected(&no_commands());
         let runner = FakeRunner::new()
             .push_ok("Unmounted /dev/sdb1.")
             .push_ok(UNMOUNTED_JSON);
@@ -1051,7 +1277,7 @@ mod tests {
 
         // `m` on the armed (already mounted) device is refused, but still cancels.
         let mut app = forceable_app();
-        app.force_unmount_selected();
+        app.force_unmount_selected(&no_commands());
         let runner = no_commands();
         assert!(app.mount_selected(&runner).is_none());
         assert_eq!(app.force_confirm, None);
@@ -1059,7 +1285,7 @@ mod tests {
 
         // Enter follows the mounted branch (unmount) and also cancels.
         let mut app = forceable_app();
-        app.force_unmount_selected();
+        app.force_unmount_selected(&no_commands());
         let runner = FakeRunner::new()
             .push_ok("Unmounted /dev/sdb1.")
             .push_ok(UNMOUNTED_JSON);
@@ -1068,7 +1294,7 @@ mod tests {
 
         // Manual refresh cancels; its own status then replaces the prompt.
         let mut app = forceable_app();
-        app.force_unmount_selected();
+        app.force_unmount_selected(&no_commands());
         let runner = FakeRunner::new().push_ok(MOUNTED_JSON);
         app.refresh(&runner);
         assert_eq!(app.force_confirm, None);
@@ -1080,7 +1306,7 @@ mod tests {
         // Not mounted.
         let mut app = app_with(vec![bd("sdb1", "part", Some("ext4"), None)]);
         app.list_state.select(Some(0));
-        assert!(app.force_unmount_selected().is_none());
+        assert!(app.force_unmount_selected(&no_commands()).is_none());
         assert_eq!(app.force_confirm, None);
         assert!(!force_prompt_shown(&app));
         match &app.action {
@@ -1093,7 +1319,7 @@ mod tests {
         // System mount.
         let mut app = app_with(vec![bd("sda2", "part", Some("ext4"), Some("/usr"))]);
         app.list_state.select(Some(0));
-        assert!(app.force_unmount_selected().is_none());
+        assert!(app.force_unmount_selected(&no_commands()).is_none());
         assert_eq!(app.force_confirm, None);
         assert!(!force_prompt_shown(&app));
 
@@ -1103,7 +1329,7 @@ mod tests {
             &["/mnt/a", "/mnt/b"],
         )]);
         app.list_state.select(Some(0));
-        assert!(app.force_unmount_selected().is_none());
+        assert!(app.force_unmount_selected(&no_commands()).is_none());
         assert_eq!(app.force_confirm, None);
         assert!(!force_prompt_shown(&app));
     }
@@ -1111,13 +1337,13 @@ mod tests {
     #[test]
     fn second_force_press_rechecks_before_running() {
         let mut app = forceable_app();
-        app.force_unmount_selected();
+        app.force_unmount_selected(&no_commands());
         assert!(app.force_confirm.is_some());
 
         // The device got unmounted between the two presses: the second press
         // must fail the pre-check instead of running `umount`.
         app.set_devices(vec![bd("sdb1", "part", Some("ext4"), None)]);
-        assert!(app.force_unmount_selected().is_none());
+        assert!(app.force_unmount_selected(&no_commands()).is_none());
         assert_eq!(app.force_confirm, None);
         match &app.action {
             ActionStatus::Error(message) => {
@@ -1128,26 +1354,133 @@ mod tests {
     }
 
     #[test]
-    fn sudo_mount_fallback_uses_safe_mount_options() {
+    fn sudo_mount_uses_the_configured_root_and_owner_options() {
         with_temp_home(|home| {
-            let runner = FakeRunner::new().push_fail("Error: not authorized");
-            let mut app = app_with(vec![bd("sdb1", "part", Some("vfat"), None)]);
+            let root = TempDir::new("sudo-root");
+            let runner = no_commands();
+            let mut app = sudo_app(vec![bd("sdb1", "part", Some("vfat"), None)], root.path());
             app.list_state.select(Some(0));
 
-            let request = app.mount_selected(&runner).expect("sudo fallback request");
+            let request = app.mount_selected(&runner).expect("sudo mount request");
+            assert_eq!(request.program, "sudo");
+            assert_eq!(request.op, InteractiveOp::Mount);
             assert_eq!(
                 request.args,
                 vec![
                     "mount".to_string(),
                     "-o".into(),
-                    SAFE_MOUNT_OPTIONS.into(),
+                    expected_owner_options(home),
                     "/dev/sdb1".into(),
-                    format!("{}/mnt/sdb1", home.display()),
+                    root.path().join("sdb1").display().to_string(),
                 ]
             );
-            // Only udisksctl ran before the fallback was built.
-            assert_eq!(runner.call_count(), 1);
+            assert_eq!(
+                request.mount_target,
+                Some(root.path().join("sdb1")),
+                "main is told which directory to create"
+            );
+            assert!(request.context.is_empty(), "{}", request.context);
+            // sudo mode never consults udisksctl first.
+            assert_eq!(runner.call_count(), 0);
+            // The App only describes the target, it must never create it.
+            assert!(
+                !root.path().join("sdb1").exists(),
+                "building the request must not create the mount point"
+            );
         });
+    }
+
+    #[test]
+    fn sudo_mount_prefers_the_label_and_reuses_a_free_directory() {
+        let root = TempDir::new("sudo-label");
+        let runner = no_commands();
+        let mut device = bd("sdb1", "part", Some("ext4"), None);
+        device.label = Some("  My/Stick  ".to_string());
+        let mut app = sudo_app(vec![device], root.path());
+        app.list_state.select(Some(0));
+
+        let request = app.mount_selected(&runner).expect("sudo mount request");
+        assert_eq!(
+            request.args.last().unwrap(),
+            &root.path().join("My_Stick").display().to_string(),
+            "a sanitised label names the target"
+        );
+        assert_eq!(request.mount_target, Some(root.path().join("My_Stick")));
+        // ext4 keeps the base options only.
+        assert_eq!(request.args[2], mount::BASE_MOUNT_OPTIONS);
+    }
+
+    #[test]
+    fn sudo_mount_refuses_a_symlinked_target() {
+        let root = TempDir::new("sudo-symlink");
+        let real = root.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, root.path().join("sdb1")).unwrap();
+
+        let runner = no_commands();
+        let mut app = sudo_app(vec![bd("sdb1", "part", Some("ext4"), None)], root.path());
+        app.list_state.select(Some(0));
+
+        assert!(app.mount_selected(&runner).is_none());
+        assert_eq!(runner.call_count(), 0);
+        match &app.action {
+            ActionStatus::Error(message) => {
+                assert!(message.contains("Cannot mount /dev/sdb1"), "{}", message);
+                assert!(message.contains("symbolic link"), "{}", message);
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn udisksctl_mount_failure_reports_an_error_without_sudo_or_directories() {
+        with_temp_home(|home| {
+            let runner = FakeRunner::new().push_fail("Error: not authorized to mount /dev/sdb1");
+            let mut app = app_with(vec![bd("sdb1", "part", Some("vfat"), None)]);
+            app.list_state.select(Some(0));
+
+            assert!(
+                app.mount_selected(&runner).is_none(),
+                "the default mode produces no interactive request"
+            );
+            assert_eq!(runner.call_count(), 1, "only udisksctl ran");
+            match &app.action {
+                ActionStatus::Error(message) => {
+                    assert!(
+                        message.contains("Mount failed for /dev/sdb1"),
+                        "{}",
+                        message
+                    );
+                    assert!(message.contains("not authorized"), "{}", message);
+                }
+                other => panic!("expected error, got {:?}", other),
+            }
+            assert!(
+                !home.join("mnt").exists(),
+                "the default mode must not create a mount point"
+            );
+        });
+    }
+
+    #[test]
+    fn udisksctl_mount_spawn_error_is_reported() {
+        let runner = FakeRunner::new().push_err("udisksctl not found");
+        let mut app = app_with(vec![bd("sdb1", "part", Some("vfat"), None)]);
+        app.list_state.select(Some(0));
+
+        assert!(app.mount_selected(&runner).is_none());
+        match &app.action {
+            ActionStatus::Error(message) => {
+                assert!(
+                    message.contains(
+                        "Mount failed for /dev/sdb1: udisksctl error: udisksctl not found"
+                    ),
+                    "{}",
+                    message
+                );
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
     }
 
     #[test]
@@ -1252,6 +1585,7 @@ mod tests {
             device_name: "sdb1".into(),
             context: "udisksctl: not authorized".into(),
             fallback_args: None,
+            mount_target: None,
         };
         assert_eq!(
             outcome_status(&request, true, Some("/media/u/USB".into())),
@@ -1283,6 +1617,7 @@ mod tests {
             device_name: "sdb1".into(),
             context: "udisksctl: target is busy".into(),
             fallback_args: None,
+            mount_target: None,
         };
         match outcome_status(&request, false, None) {
             ActionStatus::Error(message) => {
@@ -1312,6 +1647,7 @@ mod tests {
             device_name: "sdb1".into(),
             context: String::new(),
             fallback_args: Some(vec!["umount".into(), "-l".into(), "/media/u/USB".into()]),
+            mount_target: None,
         };
         assert!(matches!(
             outcome_status(&request, true, None),
@@ -1355,55 +1691,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_failure_requests_sudo_with_stderr_as_context() {
-        with_temp_home(|home| {
-            let runner = FakeRunner::new().push_fail("Error: not authorized to mount /dev/sdb1");
-
-            let mut app = app_with(vec![bd("sdb1", "part", Some("vfat"), None)]);
-            app.list_state.select(Some(0));
-
-            let request = app.mount_selected(&runner).expect("sudo fallback request");
-            assert_eq!(request.program, "sudo");
-            assert_eq!(request.op, InteractiveOp::Mount);
-            assert_eq!(request.device_name, "sdb1");
-            assert_eq!(request.args[0], "mount");
-            assert_eq!(request.args[1], "-o");
-            assert_eq!(request.args[2], SAFE_MOUNT_OPTIONS);
-            assert_eq!(request.args[3], "/dev/sdb1");
-            assert_eq!(
-                request.args[4],
-                format!("{}/mnt/sdb1", home.display()),
-                "mount point must live under HOME"
-            );
-            assert!(
-                request.context.contains("not authorized"),
-                "{}",
-                request.context
-            );
-            assert_eq!(runner.call_count(), 1);
-        });
-    }
-
-    #[test]
-    fn mount_command_error_requests_sudo_with_io_error_context() {
-        with_temp_home(|_| {
-            let runner = FakeRunner::new().push_err("udisksctl not found");
-            let mut app = app_with(vec![bd("sdb1", "part", Some("vfat"), None)]);
-            app.list_state.select(Some(0));
-
-            let request = app.mount_selected(&runner).expect("sudo fallback request");
-            assert!(
-                request
-                    .context
-                    .contains("udisksctl error: udisksctl not found"),
-                "{}",
-                request.context
-            );
-        });
-    }
-
-    #[test]
-    fn unmount_busy_context_lists_the_processes() {
+    fn unmount_busy_error_lists_the_processes_without_sudo() {
         let runner = FakeRunner::new()
             .push_fail("Error unmounting /dev/sdb1: target is busy (udisks-error-quark, 26)")
             .push_ok("                     USER        PID ACCESS COMMAND\n/dev/sdb1:           root       1234 ..c.. bash");
@@ -1414,19 +1702,29 @@ mod tests {
         )]);
         app.list_state.select(Some(0));
 
-        let request = app
-            .unmount_selected(&runner)
-            .expect("sudo fallback request");
-        assert_eq!(request.op, InteractiveOp::Unmount);
-        assert_eq!(request.args, vec!["umount".to_string(), "/dev/sdb1".into()]);
-        assert!(request.context.contains("busy"), "{}", request.context);
-        assert!(request.context.contains("1234"), "{}", request.context);
-        assert_eq!(runner.call_count(), 2);
-
-        // The same context drives the "press f" hint after the interactive run.
-        match outcome_status(&request, false, None) {
+        assert!(
+            app.unmount_selected(&runner).is_none(),
+            "the default mode produces no interactive request"
+        );
+        assert_eq!(
+            runner.call_count(),
+            2,
+            "udisksctl then the busy diagnostics"
+        );
+        assert_eq!(
+            runner.calls()[1],
+            CommandSpec::new("fuser", &["-vm", "/dev/sdb1"])
+        );
+        match &app.action {
             ActionStatus::Error(message) => {
-                assert!(message.contains("Press 'f'"), "{}", message)
+                assert!(
+                    message.contains("Unmount failed for /dev/sdb1"),
+                    "{}",
+                    message
+                );
+                assert!(message.contains("busy"), "{}", message);
+                assert!(message.contains("1234"), "{}", message);
+                assert!(message.contains("Press 'f'"), "{}", message);
             }
             other => panic!("expected error, got {:?}", other),
         }
@@ -1442,15 +1740,37 @@ mod tests {
         )]);
         app.list_state.select(Some(0));
 
-        let request = app
-            .unmount_selected(&runner)
-            .expect("sudo fallback request");
-        assert_eq!(
-            request.context,
-            "udisksctl: Error: permission denied".to_string()
-        );
+        assert!(app.unmount_selected(&runner).is_none());
         // Only udisksctl ran: fuser/lsof are not consulted when it is not busy.
         assert_eq!(runner.call_count(), 1);
+        match &app.action {
+            ActionStatus::Error(message) => {
+                assert!(message.contains("permission denied"), "{}", message);
+                assert!(!message.contains("Press 'f'"), "{}", message);
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sudo_unmount_is_an_interactive_request_without_udisksctl() {
+        let root = TempDir::new("sudo-umount");
+        let runner = no_commands();
+        let mut app = sudo_app(
+            vec![with_mounts(
+                bd("sdb1", "part", Some("ext4"), None),
+                &["/mnt/data"],
+            )],
+            root.path(),
+        );
+        app.list_state.select(Some(0));
+
+        let request = app.unmount_selected(&runner).expect("sudo umount request");
+        assert_eq!(request.program, "sudo");
+        assert_eq!(request.op, InteractiveOp::Unmount);
+        assert_eq!(request.args, vec!["umount".to_string(), "/dev/sdb1".into()]);
+        assert_eq!(request.mount_target, None);
+        assert_eq!(runner.call_count(), 0, "sudo mode skips udisksctl");
     }
 
     #[test]
@@ -1563,6 +1883,7 @@ mod tests {
             device_name: "sdb1".into(),
             context: "udisksctl: not authorized".into(),
             fallback_args: None,
+            mount_target: None,
         };
 
         app.finish(&runner, request, true);
@@ -1574,8 +1895,9 @@ mod tests {
         assert_eq!(runner.call_count(), 1);
     }
 
-    /// Redirect `HOME` to a scratch directory for the duration of `f`, so
-    /// `sudo_mount_request` never creates mount points in the real home.
+    /// Redirect `HOME` to a scratch directory for the duration of `f`, so the
+    /// owner options of a sudo mount and the default mount root never touch the
+    /// real home directory.
     ///
     /// `HOME` is process-global, so the environment lock serialises every test
     /// that uses this helper.

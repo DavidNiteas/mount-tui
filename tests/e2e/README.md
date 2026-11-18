@@ -8,9 +8,10 @@
 | `run_main.sh` | 启动界面、标签、系统盘保护（卸载/强制卸载均拒绝且不调用任何命令）、USB 挂载/卸载、LVM 成员不可挂载提示、`/home/<user>` 保护、多挂载点拒绝、`End`/`Home` 滚动、`q` 退出 | 30 |
 | `run_hotplug.sh` | 2 秒轮询自动刷新：设备出现/消失无需按键，选中项与状态栏不被刷新覆盖 | 9 |
 | `run_legacy.sh` | 旧版 `lsblk`（无 `MOUNTPOINTS`）自动回退到旧列重试，`MOUNTPOINT`/`RO`/`RM` 正确解析 | 8 |
-| `run_sudo.sh` | `udisksctl` 失败后交接给 `sudo`（终端让出/恢复、Enter 继续），CJK 长错误尾部 `END_OF_LONG_ERROR` 不被裁剪 | 8 |
+| `run_udisks_fail.sh` | 默认模式（udisksctl）失败：状态栏报错、CJK 长错误尾部 `END_OF_LONG_ERROR` 不被裁剪、界面不中断、**无 `sudo` 调用**、**不创建 `$HOME/mnt`** | 9 |
+| `run_sudo.sh` | `MOUNT_TUI_MODE=sudo`：目标在配置的根下、`sudo mount -o nosuid,nodev` 参数正确、执行前创建目标目录、失败后不残留空目录、成功时报告真实挂载点 | 14 |
 
-合计 55 项断言；`run-all.sh` 聚合四个场景，全部 PASS 才 `exit 0`。
+合计 70 项断言；`run-all.sh` 聚合五个场景，全部 PASS 才 `exit 0`。
 
 ## 依赖
 
@@ -42,10 +43,14 @@ MOUNT_TUI_BIN=target/release/mount-tui tests/e2e/run-all.sh
 - **不写仓库**：每个场景用 `mktemp -d` 建临时目录，state（`mounted`、`hotplug`、
   调用日志）全部放在 `$MOCK_STATE` 下，`trap` 在退出时删除。mock 脚本只通过
   `MOCK_STATE` 环境变量读写状态。
-- **`HOME` 隔离**：TUI 以临时目录作为 `$HOME` 启动，`sudo mount` 的兜底挂载点
-  （`$HOME/mnt/<name>`）也落在临时目录里。
+- **`HOME` 隔离**：TUI 以临时目录作为 `$HOME` 启动（`$HOME/mnt` 刻意不预建：
+  默认模式必须完全不碰它，sudo 模式要自己创建挂载根）。场景需要时通过
+  `MOUNT_TUI_MODE` / `MOUNT_TUI_MOUNT_ROOT` 传挂载配置，`common.sh` 会清掉从
+  调用者继承的 `XDG_CONFIG_HOME` 与这两个变量，避免读到真实配置。
 - **系统命令全部 stub**：`lsblk`、`udisksctl`、`sudo`、`fuser`、`lsof` 都来自
   `mock/bin`（旧列场景额外前置 `mock_legacy/bin`），mock 之外的命令不会被调用。
+  `mock sudo` 默认失败；sudo 场景用 `$MOCK_STATE/sudo_ok` 让它成功并把挂载点写进
+  `$MOCK_STATE/sdz1_mp`，由 `lsblk` mock 回读成 sdz1 的挂载点。
 - **session 隔离**：tmux session 名带 PID（`mtui_<scenario>_$$`），并行跑多个
   场景不会互相踩。
 - **二进制缺失**：提示先 `cargo build --offline` 并 `exit 1`。

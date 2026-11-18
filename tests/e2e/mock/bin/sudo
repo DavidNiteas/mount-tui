@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Mock `sudo` for tests/e2e: records the invocation, never succeeds.
+# Mock `sudo` for tests/e2e: records the invocation and fails by default.
 #
-# The safety scenarios assert that this file is never reached; the sudo-handoff
-# scenario asserts that it is.
+# The safety scenarios assert that this file is never reached; the sudo-mode
+# scenarios assert that it is. `$MOCK_STATE/sudo_ok` makes a `mount` succeed:
+# the mount point (last argument) is recorded in `$MOCK_STATE/sdz1_mp` so the
+# lsblk mock can report the device as mounted there. `umount` always fails.
 set -u
 
 if [ -z "${MOCK_STATE:-}" ]; then
@@ -11,5 +13,16 @@ if [ -z "${MOCK_STATE:-}" ]; then
 fi
 
 printf 'SUDO %s\n' "$*" >>"$MOCK_STATE/calls.log"
+
+if [ "${1:-}" = "mount" ] && [ -f "$MOCK_STATE/sudo_ok" ]; then
+    target=""
+    for arg in "$@"; do
+        target="$arg"
+    done
+    printf '%s\n' "$target" >"$MOCK_STATE/sdz1_mp"
+    echo "MOCK SUDO: mounted $target"
+    exit 0
+fi
+
 echo "MOCK SUDO: refusing (simulated failure)" >&2
 exit 1

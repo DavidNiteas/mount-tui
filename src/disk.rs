@@ -121,7 +121,8 @@ const PROTECTED_MOUNTPOINTS: &[&str] = &[
 ];
 
 /// Prefixes whose sub-mounts are protected as well. `/home/` is intentionally
-/// absent: this tool mounts under `$HOME/mnt/<name>`, which must stay unmountable.
+/// absent: sudo mode mounts under a configurable root such as
+/// `$HOME/mnt/usb/<name>`, which must stay unmountable.
 const PROTECTED_PREFIXES: &[&str] = &["/boot/", "/usr/", "/var/", "/etc/", "/opt/", "/srv/"];
 
 pub fn get_block_devices(runner: &dyn CommandRunner) -> anyhow::Result<Vec<BlockDevice>> {
