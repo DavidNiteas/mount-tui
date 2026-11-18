@@ -1,4 +1,5 @@
 mod app;
+mod cli;
 mod config;
 mod disk;
 mod mount;
@@ -6,7 +7,6 @@ mod runner;
 mod ui;
 
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::Duration;
 
@@ -28,9 +28,6 @@ type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 /// Idle interval between automatic device refreshes.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Exit code for usage / configuration errors, reported before the TUI starts.
-const EXIT_USAGE: i32 = 2;
-
 fn main() -> anyhow::Result<()> {
     install_panic_hook();
 
@@ -38,35 +35,53 @@ fn main() -> anyhow::Result<()> {
     // command goes through it.
     let runner = SystemRunner;
 
-    let cli = match config::parse_args(program_args()) {
-        Ok(config::Args::Run(overrides)) => overrides,
-        Ok(config::Args::Help) => {
+    let invocation = match cli::parse(program_args()) {
+        Ok(cli::Parsed::Run(invocation)) => invocation,
+        Ok(cli::Parsed::Help) => {
             print!(
                 "{}",
                 config::help_text(config::current_config_path().as_deref())
             );
             return Ok(());
         }
-        Ok(config::Args::Version) => {
+        Ok(cli::Parsed::Version) => {
             println!("mount-tui {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
         Err(message) => {
             eprintln!("mount-tui: {}", message);
             eprintln!("Try 'mount-tui --help' for more information.");
-            std::process::exit(EXIT_USAGE);
+            std::process::exit(cli::EXIT_USAGE);
         }
     };
 
     // A broken configuration must be readable on the normal screen: it is
     // reported before the terminal is switched to the alternate screen.
-    let config = match config::load(&cli) {
+    let config = match config::load(&invocation.overrides) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("mount-tui: configuration error: {:#}", error);
-            std::process::exit(EXIT_USAGE);
+            std::process::exit(cli::EXIT_USAGE);
         }
     };
+
+    // A CLI command never touches terminal state: no raw mode, no alternate
+    // screen, no TUI main loop. It finishes with its own exit code.
+    if invocation.command != cli::Command::Tui {
+        let interactive = cli::SystemInteractiveRunner;
+        let mut stdout = io::stdout();
+        let mut stderr = io::stderr();
+        let code = cli::run(
+            &config,
+            &invocation.command,
+            &runner,
+            &interactive,
+            &mut stdout,
+            &mut stderr,
+        );
+        let _ = stdout.flush();
+        std::process::exit(code);
+    }
 
     // Load devices before entering the alternate screen: a startup failure must
     // stay readable on the normal screen and be shown inside the TUI.
@@ -351,7 +366,7 @@ fn run_interactive(
     mut request: InteractiveRequest,
     runner: &dyn runner::CommandRunner,
 ) -> anyhow::Result<()> {
-    let created = match prepare_mount_target(&request) {
+    let created = match mount::prepare_mount_target(request.mount_target.as_deref()) {
         Ok(created) => created,
         Err(message) => {
             // Nothing to hand over: report the failure without suspending.
@@ -364,7 +379,7 @@ fn run_interactive(
     // The directory now belongs to this call: every early return below (a
     // failing `suspend`, a failing `resume`, ...) drops the guard and removes
     // it again. Only a command that actually succeeded disarms it.
-    let mut cleanup = CreatedDirGuard::new(created);
+    let mut cleanup = mount::CreatedDirGuard::new(created);
 
     session.suspend()?;
     let outcome = execute_request(&request);
@@ -395,102 +410,6 @@ fn run_interactive(
 
     app.finish(runner, request, outcome.ok);
     Ok(())
-}
-
-/// Removes the mount point created for an interactive request unless the
-/// command succeeded.
-///
-/// The guard covers every early return of [`run_interactive`] after the target
-/// exists: a failing `suspend`, `resume` or a panicking command must not leave a
-/// directory behind. A successful mount calls [`CreatedDirGuard::disarm`], so
-/// the mount point is kept.
-struct CreatedDirGuard {
-    created: Option<PathBuf>,
-}
-
-impl CreatedDirGuard {
-    fn new(created: Option<PathBuf>) -> Self {
-        Self { created }
-    }
-
-    /// Keep the directory (the mount succeeded).
-    fn disarm(&mut self) {
-        self.created = None;
-    }
-}
-
-impl Drop for CreatedDirGuard {
-    fn drop(&mut self) {
-        if let Some(path) = self.created.take() {
-            remove_empty_dir(&path);
-        }
-    }
-}
-
-/// Create the mount target of an interactive request, if it has one.
-///
-/// Returns the path when this call created it (the caller removes it again
-/// after a failed command); `None` when the directory already existed.
-///
-/// The path is checked twice: once before `create_dir_all` and once right after
-/// it. The second check closes the window between the check and the creation, in
-/// which the path could have been swapped for a symbolic link or something that
-/// is not a directory.
-fn prepare_mount_target(request: &InteractiveRequest) -> Result<Option<PathBuf>, String> {
-    let Some(target) = request.mount_target.as_deref() else {
-        return Ok(None);
-    };
-    let existed = target.exists();
-    check_mount_target(target)?;
-    std::fs::create_dir_all(target).map_err(|error| {
-        format!(
-            "failed to create mount point {}: {}",
-            target.display(),
-            error
-        )
-    })?;
-    // TOCTOU re-check: never hand a swapped path to `sudo mount`. A path that
-    // was replaced in this window is reported, not deleted: it is not ours.
-    check_mount_target(target)?;
-    Ok(if existed {
-        None
-    } else {
-        Some(target.to_path_buf())
-    })
-}
-
-/// Refuse a mount target that exists but is not a plain directory.
-///
-/// A symbolic link would redirect the mount somewhere unexpected; any other
-/// non-directory means the mount cannot work, so it is reported before the
-/// terminal is handed over. A missing or unreadable path is left to
-/// `create_dir_all`, which reports the real error.
-fn check_mount_target(target: &Path) -> Result<(), String> {
-    let Ok(metadata) = std::fs::symlink_metadata(target) else {
-        return Ok(());
-    };
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() {
-        return Err(format!(
-            "mount point {} is a symbolic link",
-            target.display()
-        ));
-    }
-    if !file_type.is_dir() {
-        return Err(format!(
-            "mount point {} is not a directory",
-            target.display()
-        ));
-    }
-    Ok(())
-}
-
-/// Remove a mount point created by a failed run.
-///
-/// `remove_dir` refuses a non-empty directory, so content that appeared there
-/// (a mount that partially succeeded) is never destroyed.
-fn remove_empty_dir(path: &Path) {
-    let _ = std::fs::remove_dir(path);
 }
 
 fn execute_request(request: &InteractiveRequest) -> RequestOutcome {
@@ -539,200 +458,5 @@ fn describe_status(status: &ExitStatus) -> String {
     match status.code() {
         Some(code) => format!("status {}", code),
         None => "a signal".to_string(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use app::{InteractiveOp, InteractiveRequest};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// Unique scratch directory; removed on drop.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            static COUNTER: AtomicUsize = AtomicUsize::new(0);
-            let unique = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!(
-                "mount-tui-main-{}-{}-{}",
-                tag,
-                std::process::id(),
-                unique
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn mount_request(target: Option<PathBuf>) -> InteractiveRequest {
-        InteractiveRequest {
-            program: "sudo".into(),
-            args: vec!["mount".into(), "/dev/sdb1".into(), "/tmp/x".into()],
-            op: InteractiveOp::Mount,
-            device_name: "sdb1".into(),
-            context: String::new(),
-            fallback_args: None,
-            mount_target: target,
-        }
-    }
-
-    #[test]
-    fn a_request_without_target_creates_nothing() {
-        let request = mount_request(None);
-        assert_eq!(prepare_mount_target(&request), Ok(None));
-    }
-
-    #[test]
-    fn preparing_creates_the_target_and_reports_it_created() {
-        let root = TempDir::new("create");
-        let target = root.path().join("usb").join("USBKEY");
-        let request = mount_request(Some(target.clone()));
-
-        assert_eq!(
-            prepare_mount_target(&request),
-            Ok(Some(target.clone())),
-            "a freshly created target is reported"
-        );
-        assert!(target.is_dir());
-        // The parents (`usb`) are created as well.
-        assert!(root.path().join("usb").is_dir());
-    }
-
-    #[test]
-    fn preparing_reuses_an_existing_directory() {
-        let root = TempDir::new("reuse");
-        let target = root.path().join("USBKEY");
-        std::fs::create_dir_all(&target).unwrap();
-
-        let request = mount_request(Some(target.clone()));
-        assert_eq!(
-            prepare_mount_target(&request),
-            Ok(None),
-            "an existing directory must not be reported as created"
-        );
-        assert!(target.is_dir());
-    }
-
-    #[test]
-    fn preparing_reports_a_failure_instead_of_panicking() {
-        let root = TempDir::new("blocked");
-        let file = root.path().join("plain-file");
-        std::fs::write(&file, b"x").unwrap();
-
-        let request = mount_request(Some(file.join("nested")));
-        let error = prepare_mount_target(&request).unwrap_err();
-        assert!(error.contains("failed to create mount point"), "{}", error);
-    }
-
-    #[test]
-    fn preparing_refuses_a_symbolic_link() {
-        let root = TempDir::new("symlink");
-        let real = root.path().join("real");
-        std::fs::create_dir_all(&real).unwrap();
-        let link = root.path().join("USBKEY");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-
-        let request = mount_request(Some(link.clone()));
-        let error = prepare_mount_target(&request).unwrap_err();
-        assert!(error.contains("is a symbolic link"), "{}", error);
-        assert!(link.is_symlink(), "the link must be left untouched");
-    }
-
-    #[test]
-    fn preparing_refuses_a_non_directory() {
-        let root = TempDir::new("file-target");
-        let file = root.path().join("not-a-directory");
-        std::fs::write(&file, b"x").unwrap();
-
-        let request = mount_request(Some(file.clone()));
-        let error = prepare_mount_target(&request).unwrap_err();
-        assert!(error.contains("is not a directory"), "{}", error);
-        assert!(file.is_file(), "the existing file must survive");
-    }
-
-    #[test]
-    fn the_target_checker_accepts_a_missing_path_and_a_real_directory() {
-        let root = TempDir::new("checker");
-        assert_eq!(check_mount_target(&root.path().join("missing")), Ok(()));
-
-        let nested = root.path().join("nested");
-        std::fs::create_dir_all(&nested).unwrap();
-        assert_eq!(check_mount_target(&nested), Ok(()));
-    }
-
-    #[test]
-    fn the_cleanup_guard_removes_the_created_directory_on_drop() {
-        let root = TempDir::new("guard-drop");
-        let target = root.path().join("USBKEY");
-        std::fs::create_dir_all(&target).unwrap();
-
-        {
-            let _guard = CreatedDirGuard::new(Some(target.clone()));
-            // An early return (`suspend` / `resume` failure) leaves the scope
-            // without disarming.
-        }
-        assert!(
-            !target.exists(),
-            "a request that never mounted removes its mount point"
-        );
-    }
-
-    #[test]
-    fn the_cleanup_guard_keeps_the_directory_after_disarm() {
-        let root = TempDir::new("guard-disarm");
-        let target = root.path().join("USBKEY");
-        std::fs::create_dir_all(&target).unwrap();
-
-        {
-            let mut guard = CreatedDirGuard::new(Some(target.clone()));
-            guard.disarm();
-        }
-        assert!(target.is_dir(), "a successful mount keeps its mount point");
-    }
-
-    #[test]
-    fn the_cleanup_guard_ignores_a_reused_directory_and_content() {
-        let root = TempDir::new("guard-none");
-        // Nothing was created by us: dropping the guard is a no-op.
-        drop(CreatedDirGuard::new(None));
-
-        // Content that appeared in the meantime (a partially successful mount)
-        // must never be destroyed: only empty directories are removed.
-        let occupied = root.path().join("occupied");
-        std::fs::create_dir_all(&occupied).unwrap();
-        std::fs::write(occupied.join("data"), b"x").unwrap();
-        drop(CreatedDirGuard::new(Some(occupied.clone())));
-        assert!(occupied.join("data").is_file());
-    }
-
-    #[test]
-    fn cleanup_removes_only_empty_directories() {
-        let root = TempDir::new("cleanup");
-
-        let empty = root.path().join("empty");
-        std::fs::create_dir_all(&empty).unwrap();
-        remove_empty_dir(&empty);
-        assert!(!empty.exists(), "an empty created mount point is removed");
-
-        let occupied = root.path().join("occupied");
-        std::fs::create_dir_all(&occupied).unwrap();
-        std::fs::write(occupied.join("data"), b"x").unwrap();
-        remove_empty_dir(&occupied);
-        assert!(occupied.is_dir(), "a non-empty directory must survive");
-
-        // A missing path is a no-op, not a panic.
-        remove_empty_dir(&root.path().join("missing"));
     }
 }

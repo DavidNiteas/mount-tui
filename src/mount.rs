@@ -202,6 +202,102 @@ pub fn home_owner() -> Option<(u32, u32)> {
     Some((metadata.uid(), metadata.gid()))
 }
 
+/// Create the mount target of a sudo mount, if it has one.
+///
+/// Returns the path when this call created it (the caller removes it again
+/// after a failed command); `None` when the directory already existed.
+///
+/// The path is checked twice: once before `create_dir_all` and once right after
+/// it. The second check closes the window between the check and the creation, in
+/// which the path could have been swapped for a symbolic link or something that
+/// is not a directory.
+pub fn prepare_mount_target(target: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let existed = target.exists();
+    check_mount_target(target)?;
+    std::fs::create_dir_all(target).map_err(|error| {
+        format!(
+            "failed to create mount point {}: {}",
+            target.display(),
+            error
+        )
+    })?;
+    // TOCTOU re-check: never hand a swapped path to `sudo mount`. A path that
+    // was replaced in this window is reported, not deleted: it is not ours.
+    check_mount_target(target)?;
+    Ok(if existed {
+        None
+    } else {
+        Some(target.to_path_buf())
+    })
+}
+
+/// Refuse a mount target that exists but is not a plain directory.
+///
+/// A symbolic link would redirect the mount somewhere unexpected; any other
+/// non-directory means the mount cannot work, so it is reported before the
+/// terminal is handed over. A missing or unreadable path is left to
+/// `create_dir_all`, which reports the real error.
+pub fn check_mount_target(target: &Path) -> Result<(), String> {
+    let Ok(metadata) = std::fs::symlink_metadata(target) else {
+        return Ok(());
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(format!(
+            "mount point {} is a symbolic link",
+            target.display()
+        ));
+    }
+    if !file_type.is_dir() {
+        return Err(format!(
+            "mount point {} is not a directory",
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Remove a mount point created by a failed run.
+///
+/// `remove_dir` refuses a non-empty directory, so content that appeared there
+/// (a mount that partially succeeded) is never destroyed.
+pub fn remove_empty_dir(path: &Path) {
+    let _ = std::fs::remove_dir(path);
+}
+
+/// Removes the mount point created for one operation unless the command
+/// succeeded.
+///
+/// The guard covers every early return after the target exists: a failing
+/// command, a cancelled `sudo` or a panic must not leave a directory behind. A
+/// successful mount calls [`CreatedDirGuard::disarm`], so the mount point is
+/// kept.
+pub struct CreatedDirGuard {
+    created: Option<PathBuf>,
+}
+
+impl CreatedDirGuard {
+    pub fn new(created: Option<PathBuf>) -> Self {
+        Self { created }
+    }
+
+    /// Keep the directory (the mount succeeded).
+    pub fn disarm(&mut self) {
+        self.created = None;
+    }
+}
+
+impl Drop for CreatedDirGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.created.take() {
+            remove_empty_dir(&path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +546,147 @@ mod tests {
             let metadata = std::fs::metadata(std::env::var_os("HOME").unwrap()).unwrap();
             assert_eq!(owner, (metadata.uid(), metadata.gid()));
         }
+    }
+
+    #[test]
+    fn a_missing_target_creates_nothing() {
+        assert_eq!(prepare_mount_target(None), Ok(None));
+    }
+
+    #[test]
+    fn preparing_creates_the_target_and_reports_it_created() {
+        let root = TempDir::new("create");
+        let target = root.path().join("usb").join("USBKEY");
+
+        assert_eq!(
+            prepare_mount_target(Some(&target)),
+            Ok(Some(target.clone())),
+            "a freshly created target is reported"
+        );
+        assert!(target.is_dir());
+        // The parents (`usb`) are created as well.
+        assert!(root.path().join("usb").is_dir());
+    }
+
+    #[test]
+    fn preparing_reuses_an_existing_directory() {
+        let root = TempDir::new("reuse");
+        let target = root.path().join("USBKEY");
+        std::fs::create_dir_all(&target).unwrap();
+
+        assert_eq!(
+            prepare_mount_target(Some(&target)),
+            Ok(None),
+            "an existing directory must not be reported as created"
+        );
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn preparing_reports_a_failure_instead_of_panicking() {
+        let root = TempDir::new("blocked");
+        let file = root.path().join("plain-file");
+        std::fs::write(&file, b"x").unwrap();
+
+        let error = prepare_mount_target(Some(&file.join("nested"))).unwrap_err();
+        assert!(error.contains("failed to create mount point"), "{}", error);
+    }
+
+    #[test]
+    fn preparing_refuses_a_symbolic_link() {
+        let root = TempDir::new("symlink-target");
+        let real = root.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.path().join("USBKEY");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let error = prepare_mount_target(Some(&link)).unwrap_err();
+        assert!(error.contains("is a symbolic link"), "{}", error);
+        assert!(link.is_symlink(), "the link must be left untouched");
+    }
+
+    #[test]
+    fn preparing_refuses_a_non_directory() {
+        let root = TempDir::new("file-target");
+        let file = root.path().join("not-a-directory");
+        std::fs::write(&file, b"x").unwrap();
+
+        let error = prepare_mount_target(Some(&file)).unwrap_err();
+        assert!(error.contains("is not a directory"), "{}", error);
+        assert!(file.is_file(), "the existing file must survive");
+    }
+
+    #[test]
+    fn the_target_checker_accepts_a_missing_path_and_a_real_directory() {
+        let root = TempDir::new("checker");
+        assert_eq!(check_mount_target(&root.path().join("missing")), Ok(()));
+
+        let nested = root.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(check_mount_target(&nested), Ok(()));
+    }
+
+    #[test]
+    fn the_cleanup_guard_removes_the_created_directory_on_drop() {
+        let root = TempDir::new("guard-drop");
+        let target = root.path().join("USBKEY");
+        std::fs::create_dir_all(&target).unwrap();
+
+        {
+            let _guard = CreatedDirGuard::new(Some(target.clone()));
+            // An early return (a cancelled command) leaves the scope without
+            // disarming.
+        }
+        assert!(
+            !target.exists(),
+            "an operation that never mounted removes its mount point"
+        );
+    }
+
+    #[test]
+    fn the_cleanup_guard_keeps_the_directory_after_disarm() {
+        let root = TempDir::new("guard-disarm");
+        let target = root.path().join("USBKEY");
+        std::fs::create_dir_all(&target).unwrap();
+
+        {
+            let mut guard = CreatedDirGuard::new(Some(target.clone()));
+            guard.disarm();
+        }
+        assert!(target.is_dir(), "a successful mount keeps its mount point");
+    }
+
+    #[test]
+    fn the_cleanup_guard_ignores_a_reused_directory_and_content() {
+        let root = TempDir::new("guard-none");
+        // Nothing was created by us: dropping the guard is a no-op.
+        drop(CreatedDirGuard::new(None));
+
+        // Content that appeared in the meantime (a partially successful mount)
+        // must never be destroyed: only empty directories are removed.
+        let occupied = root.path().join("occupied");
+        std::fs::create_dir_all(&occupied).unwrap();
+        std::fs::write(occupied.join("data"), b"x").unwrap();
+        drop(CreatedDirGuard::new(Some(occupied.clone())));
+        assert!(occupied.join("data").is_file());
+    }
+
+    #[test]
+    fn cleanup_removes_only_empty_directories() {
+        let root = TempDir::new("cleanup");
+        let empty = root.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        remove_empty_dir(&empty);
+        assert!(!empty.exists(), "an empty created mount point is removed");
+
+        let occupied = root.path().join("occupied");
+        std::fs::create_dir_all(&occupied).unwrap();
+        std::fs::write(occupied.join("data"), b"x").unwrap();
+        remove_empty_dir(&occupied);
+        assert!(occupied.is_dir(), "a non-empty directory must survive");
+
+        // A missing path is a no-op, not a panic.
+        remove_empty_dir(&root.path().join("missing"));
     }
 
     #[test]

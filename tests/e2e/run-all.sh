@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run every mount-tui end-to-end scenario; exit 0 only when all of them pass.
 #
-# Requirements: a built debug binary (cargo build --offline) and tmux.
+# Requirements: a built debug binary (cargo build --offline), tmux and python3
+# (the CLI scenario validates JSON output with it).
 # Mock `lsblk` / `udisksctl` / `sudo` come from tests/e2e/mock*/bin, so no real
 # device, mount or sudo prompt is ever touched.
 set -u
@@ -14,13 +15,17 @@ if ! command -v tmux >/dev/null 2>&1; then
     echo "FAIL: tmux is required to run the end-to-end scenarios" >&2
     exit 1
 fi
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "FAIL: python3 is required to validate the CLI JSON output" >&2
+    exit 1
+fi
 if [ ! -x "$BIN" ]; then
     echo "FAIL: $BIN not found; run 'cargo build --offline' first" >&2
     exit 1
 fi
 
 fail=0
-for scenario in run_main.sh run_hotplug.sh run_legacy.sh run_udisks_fail.sh run_sudo.sh run_force.sh run_search.sh; do
+for scenario in run_main.sh run_hotplug.sh run_legacy.sh run_udisks_fail.sh run_sudo.sh run_force.sh run_search.sh run_cli.sh; do
     echo "=== ${scenario%.sh} ==="
     if ! bash "$E2E_DIR/$scenario"; then
         fail=1

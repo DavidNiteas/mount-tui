@@ -343,62 +343,6 @@ pub fn parse_file(text: &str) -> anyhow::Result<Overrides> {
     Ok(overrides)
 }
 
-/// Result of parsing the command line.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Args {
-    /// Start the TUI with these command line overrides.
-    Run(Overrides),
-    /// `--help`: usage was printed, do not start the TUI.
-    Help,
-    /// `--version`: the version was printed, do not start the TUI.
-    Version,
-}
-
-/// Parse the command line. `Err` carries a user-facing usage error.
-pub fn parse_args<I, S>(args: I) -> Result<Args, String>
-where
-    I: IntoIterator<Item = S>,
-    S: Into<String>,
-{
-    let args: Vec<String> = args.into_iter().map(Into::into).collect();
-    let mut overrides = Overrides::default();
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].as_str();
-        match arg {
-            "--help" | "-h" => return Ok(Args::Help),
-            "--version" | "-V" => return Ok(Args::Version),
-            "--mount-mode" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "--mount-mode needs a value".to_string())?;
-                overrides.mode = Some(value.clone());
-                index += 2;
-            }
-            "--mount-root" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "--mount-root needs a value".to_string())?;
-                overrides.root = Some(value.clone());
-                index += 2;
-            }
-            _ => {
-                if let Some(value) = arg.strip_prefix("--mount-mode=") {
-                    overrides.mode = Some(value.to_string());
-                } else if let Some(value) = arg.strip_prefix("--mount-root=") {
-                    overrides.root = Some(value.to_string());
-                } else if arg.starts_with('-') {
-                    return Err(format!("unknown option '{}'", arg));
-                } else {
-                    return Err(format!("unexpected argument '{}'", arg));
-                }
-                index += 1;
-            }
-        }
-    }
-    Ok(Args::Run(overrides))
-}
-
 /// `--help` text. `config_path` is resolved at runtime so the user sees the
 /// file this run would actually read.
 pub fn help_text(config_path: Option<&Path>) -> String {
@@ -411,9 +355,28 @@ pub fn help_text(config_path: Option<&Path>) -> String {
 Terminal disk & USB manager.
 
 Usage:
-  mount-tui [--mount-mode <udisksctl|sudo>] [--mount-root <path>]
+  mount-tui [options]                     Start the terminal UI (default).
+  mount-tui tui [options]                 Start the terminal UI explicitly.
+  mount-tui list [--json]
+  mount-tui status <dev> [--json]
+  mount-tui mount <dev>
+  mount-tui unmount <dev>
+  mount-tui force-unmount <dev> --yes
+
+Commands:
+  tui                  Interactive device manager (no subcommand does the same).
+  list                 Print the device tree.
+  status <dev>         Print one device with its mount state.
+  mount <dev>          Mount a device.
+  unmount <dev>        Unmount a device.
+  force-unmount <dev>  Lazy unmount; requires --yes.
+
+  <dev> is a device name (sdb1), a path (/dev/sdb1) or a unique label
+  (case-insensitive). An unknown or ambiguous <dev> is a usage error.
 
 Options:
+  --json               Machine readable output (list, status).
+  --yes, -y            Confirm a force-unmount (a lazy unmount may lose data).
   --mount-mode <mode>  Mount backend: 'udisksctl' (default, no sudo, mount point
                        chosen by udisks2) or 'sudo' (explicit opt-in, mounts into
                        the configured root).
@@ -421,6 +384,11 @@ Options:
                        Absolute path or '~/...'; system directories are refused.
   -h, --help           Print this help and exit.
   -V, --version        Print the version and exit.
+
+Exit codes:
+  0  success
+  1  operation failed
+  2  usage or configuration error
 
 Configuration file:
   {config_path}
@@ -958,44 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn command_line_parsing_accepts_both_value_forms() {
-        assert_eq!(
-            parse_args(["--mount-mode", "sudo", "--mount-root", "/srv/usb"]).unwrap(),
-            Args::Run(layer(Some("sudo"), Some("/srv/usb")))
-        );
-        assert_eq!(
-            parse_args(["--mount-mode=sudo", "--mount-root=~/usb"]).unwrap(),
-            Args::Run(layer(Some("sudo"), Some("~/usb")))
-        );
-        assert_eq!(
-            parse_args(std::iter::empty::<String>()).unwrap(),
-            Args::Run(empty())
-        );
-        assert_eq!(parse_args(["--help"]).unwrap(), Args::Help);
-        assert_eq!(parse_args(["-h"]).unwrap(), Args::Help);
-        assert_eq!(parse_args(["--version"]).unwrap(), Args::Version);
-        assert_eq!(parse_args(["-V"]).unwrap(), Args::Version);
-        // Later values win, exactly like any other CLI parser.
-        assert_eq!(
-            parse_args(["--mount-mode", "sudo", "--mount-mode", "udisksctl"]).unwrap(),
-            Args::Run(layer(Some("udisksctl"), None))
-        );
-    }
-
-    #[test]
-    fn command_line_parsing_rejects_useless_input() {
-        let error = parse_args(["--mount-mode"]).unwrap_err();
-        assert!(error.contains("needs a value"), "{}", error);
-        let error = parse_args(["--mount-root"]).unwrap_err();
-        assert!(error.contains("needs a value"), "{}", error);
-        let error = parse_args(["--nope"]).unwrap_err();
-        assert!(error.contains("unknown option"), "{}", error);
-        let error = parse_args(["extra"]).unwrap_err();
-        assert!(error.contains("unexpected argument"), "{}", error);
-    }
-
-    #[test]
-    fn help_text_documents_the_layers_and_defaults() {
+    fn help_text_documents_the_layers_defaults_and_commands() {
         let text = help_text(Some(Path::new("/home/u/.config/mount-tui/config.toml")));
         assert!(text.contains("--mount-mode"), "{}", text);
         assert!(text.contains("--mount-root"), "{}", text);
@@ -1009,5 +940,25 @@ mod tests {
         assert!(text.contains(ENV_MOUNT_ROOT), "{}", text);
         assert!(text.contains(env!("CARGO_PKG_VERSION")), "{}", text);
         assert!(help_text(None).contains("<HOME unavailable>"));
+    }
+
+    #[test]
+    fn help_text_lists_every_command_and_exit_code() {
+        let text = help_text(None);
+        for command in [
+            "tui",
+            "list",
+            "status <dev>",
+            "mount <dev>",
+            "unmount <dev>",
+            "force-unmount <dev>",
+        ] {
+            assert!(text.contains(command), "missing '{}' in\n{}", command, text);
+        }
+        assert!(text.contains("--json"), "{}", text);
+        assert!(text.contains("--yes"), "{}", text);
+        assert!(text.contains("0  success"), "{}", text);
+        assert!(text.contains("1  operation failed"), "{}", text);
+        assert!(text.contains("2  usage or configuration error"), "{}", text);
     }
 }

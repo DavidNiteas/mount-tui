@@ -12,12 +12,14 @@
 | `run_sudo.sh` | `MOUNT_TUI_MODE=sudo`：目标在配置的根下、`sudo mount -o nosuid,nodev` 参数正确、执行前创建目标目录、失败后不残留空目录、成功时报告真实挂载点、`sudo umount` 成功、再次挂载、`f`×2 → `sudo umount -l` 且挂载点消失 | 23 |
 | `run_force.sh` | 默认模式强制卸载：`m` 挂载 → 第一次 `f` 只提示且不执行命令 → 第二次 `f` 执行 `udisksctl unmount -b /dev/sdb1 -f`，状态栏报成功、设备回到未挂载、**无 `sudo` 调用** | 10 |
 | `run_search.sh` | loop 过滤（默认隐藏 → `l` 显示 → `l` 再隐藏）、实时搜索（`/` 输入、边打边过滤、Enter 保留、Esc 清除）、无匹配空列表、`[`/`]` 详情滚动 | 19 |
+| `run_cli.sh` | 非交互 CLI（不用 tmux）：`--help/--version`、`list`/`list --json`（`python3` 解析 JSON）、`status`（名称/路径/label 大小写不敏感）、`mount`/`unmount`/`force-unmount --yes`、退出码 0/1/2、安全拒绝（系统盘/多挂载/LVM/已挂载）不执行任何命令、默认模式零 sudo 零目录、sudo 模式目标创建/失败清理/`sudo umount`/`umount -l` | 76 |
 
-合计 108 项断言；`run-all.sh` 聚合七个场景，全部 PASS 才 `exit 0`。
+合计 184 项断言；`run-all.sh` 聚合八个场景，全部 PASS 才 `exit 0`。
 
 ## 依赖
 
-- Linux + `tmux`（`tmux -V` 能跑即可）
+- Linux + `tmux`（TUI 场景；`run_cli.sh` 本身不需要 tmux）
+- `python3`：校验 CLI 的 JSON 输出
 - 已构建的调试二进制：`cargo build`（本仓库开发环境可加 `--offline`）
 - 不需要 root、不需要真实块设备、不会真的挂载/卸载任何东西
 
@@ -58,6 +60,9 @@ MOUNT_TUI_BIN=target/release/mount-tui tests/e2e/run-all.sh
   让 `umount`（含 `umount -l`）成功并删除该挂载点记录。
 - **session 隔离**：tmux session 名带 PID（`mtui_<scenario>_$$`），并行跑多个
   场景不会互相踩。
+- **CLI 场景无终端**：`run_cli.sh` 不启动 tmux，只以重定向的 stdout/stderr
+  运行二进制，因此能验证「CLI 不初始化终端」这一点（没有任何 raw mode / 备用屏
+  的输出）；JSON 用 `python3` 解析，退出码用子进程状态断言。
 - **二进制缺失**：提示先 `cargo build --offline` 并 `exit 1`。
 
 ## 限制

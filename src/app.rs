@@ -958,7 +958,7 @@ fn force_confirm_prompt(device_name: &str) -> String {
 /// while the mount point may (`/media/user/My at Disk`). The sentence period is
 /// only removed when the dot-terminated path does not exist, so a directory
 /// whose name really ends in `.` keeps its name.
-fn parse_udisks_mountpoint(stdout: &str) -> Option<String> {
+pub(crate) fn parse_udisks_mountpoint(stdout: &str) -> Option<String> {
     let line = stdout.trim();
     let (_, mount_point) = line.split_once(" at ")?;
     let mount_point = mount_point.trim();

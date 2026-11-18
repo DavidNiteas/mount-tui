@@ -5,6 +5,9 @@
 详情（型号、传输方式、文件系统、卷标、UUID、挂载点、是否受保护），底部是状态栏
 与键位提示。
 
+同一个二进制也提供非交互子命令（`list` / `status` / `mount` / `unmount` /
+`force-unmount`，见「命令行（非交互）」），供脚本使用。
+
 状态栏按实际渲染行数自动增高（上限 8 行）：8 行以内的 CJK 长错误不会被截断，
 超过上限仍会裁剪。设备多时可以用搜索过滤列表，`l` 隐藏 loop 设备（snap 镜像等），
 右侧详情可用 `[` / `]` 滚动；终端太矮时键位提示自动收起，把行数让给设备列表。
@@ -56,6 +59,146 @@ serde_json / anyhow / toml；系统命令依赖见上一节。本仓库开发环
 **配置错误**（未知模式、非法挂载根等）在进入 TUI 之前打印到 stderr 并以非零退出码
 结束。运行期出现无法恢复的错误（例如终端初始化失败）时，程序先恢复终端，再以
 **非零退出码**结束——脚本可以据此判断成败。
+
+## 命令行（非交互）
+
+同一个二进制也能在脚本里使用：不初始化终端、不进入 raw mode / 备用屏，直接读写
+stdout / stderr 并返回退出码。
+
+```bash
+mount-tui                                  # 默认：启动 TUI
+mount-tui tui                              # 显式启动 TUI
+mount-tui list                             # 设备树（人类可读）
+mount-tui list --json                      # 设备树（JSON）
+mount-tui status sdb1                      # 单个设备的字段与挂载状态
+mount-tui status /dev/sdb1 --json
+mount-tui mount sdb1
+mount-tui unmount sdb1
+mount-tui force-unmount sdb1 --yes
+mount-tui --help | --version
+```
+
+`--mount-mode` / `--mount-root` 对所有命令生效，位置可以在子命令前后；配置文件与
+环境变量的优先级与 TUI 完全相同（见下一节）。
+
+### 设备参数
+
+`<dev>` 可以是：
+
+- 设备名：`sdb1`；
+- 设备路径：`/dev/sdb1`；
+- 卷标：`USBKEY`（大小写不敏感，首尾空白忽略）。
+
+查找会遍历整棵设备树（含分区、crypt、LVM 子节点）。**找不到**或**匹配到多个**
+（例如两个分区同名卷标）时按用法错误处理（退出码 2），stderr 会列出可用名称或
+歧义项。
+
+### list / status
+
+`list` 每行一个设备，子节点缩进两格：
+
+```text
+sda 100G disk - - -
+  sda1 100G part ext4 - /home [sys]
+sdb 8G disk - - - [usb] [rm]
+  sdb1 8G part vfat USBKEY - [usb] [rm]
+sdy1 1T part ext4 MULTI /mnt/a,/mnt/b
+```
+
+列依次为：名称、容量、类型、文件系统、卷标、挂载点（多个用 `,` 连接，未挂载为
+`-`），随后是标记：`[sys]`（挂载在受保护的系统路径上）、`[usb]`、`[ro]`
+（只读）、`[rm]`（可移动）。
+
+`status` 输出同样的字段加派生状态（`mounted` / `mountable` / `protected` /
+`multi_mount`）：
+
+```text
+path: /dev/sdb1
+name: sdb1
+size: 8G
+type: part
+fstype: vfat
+label: USBKEY
+uuid: ABCD-1234
+...
+mountpoints: -
+mounted: false
+mountable: true
+protected: false
+multi_mount: false
+```
+
+`--json` 输出到 stdout（错误仍走 stderr），可以直接交给 `jq`：
+
+```console
+$ mount-tui status USBKEY --json
+{
+  "path": "/dev/sdb1",
+  "name": "sdb1",
+  "size": "8G",
+  "type": "part",
+  "fstype": "vfat",
+  "label": "USBKEY",
+  "uuid": "ABCD-1234",
+  "model": null,
+  "vendor": null,
+  "tran": "usb",
+  "serial": null,
+  "mountpoints": [],
+  "ro": false,
+  "rm": true,
+  "usb": true,
+  "mounted": false,
+  "mountable": true,
+  "protected": false,
+  "multi_mount": false
+}
+```
+
+`list --json` 是设备对象数组，每个对象带 `children` 数组（子节点同构，叶子为空
+数组）：
+
+```console
+$ mount-tui list --json | jq -r '.[] | [.name, (.children|length)] | @tsv'
+```
+
+### mount / unmount / force-unmount
+
+| 命令 | `udisksctl`（默认） | `sudo`（opt-in） |
+|---|---|---|
+| `mount <dev>` | `udisksctl mount -b /dev/X` | `sudo mount -o <options> /dev/X <root>/<label-or-name>` |
+| `unmount <dev>` | `udisksctl unmount -b /dev/X` | `sudo umount /dev/X` |
+| `force-unmount <dev> --yes` | `udisksctl unmount -b /dev/X -f` | `sudo umount -l /dev/X`（失败再对挂载点重试） |
+
+- **默认模式不提权、不创建目录**：`udisksctl` 失败就是失败（退出码 1），不会回退
+  `sudo`。
+- **sudo 模式**复用 TUI 的挂载点规则：目标在配置的根目录下、冲突时加后缀、符号
+  链接拒绝；执行前创建目标目录（stdin/stdout/stderr 继承，`sudo` 可正常提示密码），
+  本次新建的目标在失败或取消后删除（仅当仍为空）。
+- 成功后重新读取设备并打印**真实**挂载点（读不到时退回计划路径 / 仅报完成）；
+  失败时把 `udisksctl` / `sudo` 的错误打印到 stderr。
+- 安全规则与 TUI 完全一致：挂载要求有文件系统且未挂载；卸载/强制卸载要求已挂载、
+  不是系统盘（任一挂载点）、不是多挂载点。拒绝时不执行任何命令，退出码 1。
+- `force-unmount` 必须带 `--yes`（强制卸载是惰性摘除挂载点，仍写盘的进程可能丢
+  数据），否则按用法错误退出 2。
+
+### 退出码
+
+| 码 | 含义 |
+|---|---|
+| `0` | 成功 |
+| `1` | 操作失败（命令失败、`lsblk` 读不到、安全拒绝） |
+| `2` | 用法或配置错误（未知子命令/参数、缺 `--yes`、设备不存在或有歧义、配置非法） |
+
+脚本示例：
+
+```bash
+if mount-tui mount USBKEY >/dev/null 2>&1; then
+    echo "mounted at $(mount-tui status USBKEY --json | jq -r '.mountpoints[0]')"
+else
+    echo "mount failed" >&2
+fi
+```
 
 ## 配置
 
@@ -237,8 +380,10 @@ tests/e2e/run-all.sh
 覆盖系统盘保护、多挂载拒绝、USB 挂载/卸载、LVM 成员提示、滚动、标签、热插拔
 自动刷新、旧版 `lsblk` 回退、默认模式失败不提权不建目录、默认模式强制卸载
 （二次确认 → `udisksctl unmount -f`）、sudo 模式的目标/选项/失败清理、卸载、
-再次挂载与强制卸载成功报告、loop 过滤、实时搜索与详情滚动。详见
-[`tests/e2e/README.md`](tests/e2e/README.md)。
+再次挂载与强制卸载成功报告、loop 过滤、实时搜索与详情滚动，以及非交互 CLI
+（`list`/`status` 的人类与 JSON 输出、设备名/路径/卷标解析、退出码 0/1/2、
+mount/unmount/force-unmount、默认模式零提权零目录、sudo 模式的目标与失败清理）。
+详见 [`tests/e2e/README.md`](tests/e2e/README.md)。
 
 ## 已知限制
 
@@ -257,4 +402,8 @@ tests/e2e/run-all.sh
   可用，完整列表见上表）。
 - **命令同步执行**：`udisksctl` 挂载/卸载期间界面短暂冻结（后台执行是后续版本的
   内容）。
+- **CLI 每次调用都重新读取设备**：非交互子命令不维护缓存，也不做后台自动刷新；
+  热插拔后重新执行一次命令即可。
+- **JSON 字段只追加**：`list --json` / `status --json` 的字段名不会改名或删除，
+  新字段只会追加，因此已有脚本不会因为升级而失效。
 - 不处理 LUKS 解锁、`fstab` 编辑与挂载选项。
