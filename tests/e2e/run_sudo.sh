@@ -4,7 +4,9 @@
 # The mount point is `<MOUNT_TUI_MOUNT_ROOT>/<label-or-name>`, created right
 # before the terminal handoff and removed again when the mount fails. A second
 # attempt with a succeeding `sudo mount` keeps it and reports the real mount
-# point. udisksctl is never consulted in this mode.
+# point. The mounted device is then unmounted (`u`), mounted again and finally
+# force-unmounted (`f` `f` → `sudo umount -l`). udisksctl is never consulted in
+# this mode.
 set -u
 
 # shellcheck source=common.sh
@@ -48,6 +50,33 @@ cap sudo_mounted
 check "successful mount reports the real mount point" "Mounted /dev/sdz1 at" "$OUT/sudo_mounted.txt"
 check "the configured root is reported" "mnt/usb/sdz1" "$OUT/sudo_mounted.txt"
 check_path "successful mount keeps the mount point" "$TARGET"
+
+# --- succeeding `sudo umount` --------------------------------------------
+touch "$STATE/sudo_umount_ok"
+send u
+sleep 0.8
+cap sudo_unmounted
+check "sudo umount invoked" "SUDO umount /dev/sdz1" "$STATE/calls.log"
+check "unmount reports success" "Unmounted /dev/sdz1" "$OUT/sudo_unmounted.txt"
+check_no_path "unmounted device has no mount point any more" "$STATE/sdz1_mp"
+
+# --- mounting the same device again --------------------------------------
+send m
+sleep 0.8
+cap sudo_remounted
+check "second sudo mount reports the mount point" "Mounted /dev/sdz1 at" "$OUT/sudo_remounted.txt"
+check_path "the mount point is reused" "$TARGET"
+
+# --- sudo force unmount (`umount -l`) ------------------------------------
+send f
+cap sudo_force_prompt
+check "first f asks for the confirmation" "Press f again to force-unmount sdz1" "$OUT/sudo_force_prompt.txt"
+send f
+sleep 0.8
+cap sudo_forced
+check "sudo force unmount uses umount -l" "SUDO umount -l /dev/sdz1" "$STATE/calls.log"
+check "force unmount reports success" "Force unmounted /dev/sdz1" "$OUT/sudo_forced.txt"
+check_no_path "force unmount clears the mount point" "$STATE/sdz1_mp"
 
 expect_exit
 

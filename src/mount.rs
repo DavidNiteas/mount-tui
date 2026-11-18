@@ -133,8 +133,10 @@ fn slot(path: &Path) -> Result<Slot, TargetError> {
         Ok(metadata) => metadata,
         // Nothing there yet: `create_dir_all` will make it.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Slot::Reusable),
-        // Unreadable: let the actual `mkdir` / `mount` report the real error.
-        Err(_) => return Ok(Slot::Reusable),
+        // Unreadable (`EACCES`, `ENOTDIR`, ...): a path that cannot be
+        // inspected is never reused — skip the candidate. Same orientation as
+        // an unreadable directory below.
+        Err(_) => return Ok(Slot::Taken),
     };
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
@@ -327,6 +329,35 @@ mod tests {
         std::fs::write(root.path().join("USBKEY"), b"not a directory").unwrap();
         let target = resolve_target(root.path(), &device("sdb1", Some("USBKEY"), None)).unwrap();
         assert_eq!(target, root.path().join("USBKEY-sdb1"));
+    }
+
+    #[test]
+    fn an_unreadable_candidate_is_taken() {
+        let root = TempDir::new("unreadable");
+        let file = root.path().join("plain-file");
+        std::fs::write(&file, b"x").unwrap();
+
+        // `<file>/child` cannot be inspected at all (ENOTDIR): a path that
+        // cannot be checked is never reused.
+        assert_eq!(slot(&file.join("child")).unwrap(), Slot::Taken);
+        // A missing path is still reusable.
+        assert_eq!(slot(&root.path().join("missing")).unwrap(), Slot::Reusable);
+    }
+
+    #[test]
+    fn an_uninspectable_root_is_not_reused() {
+        let root = TempDir::new("uninspectable-root");
+        let file = root.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+
+        // Every candidate lives below a plain file: all are skipped, so the
+        // resolution reports `Exhausted` instead of pointing into a non-directory.
+        let error = resolve_target(&file, &device("sdb1", Some("USBKEY"), None)).unwrap_err();
+        assert!(
+            matches!(error, TargetError::Exhausted { .. }),
+            "expected Exhausted, got {:?}",
+            error
+        );
     }
 
     #[test]

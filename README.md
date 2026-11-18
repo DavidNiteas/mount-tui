@@ -146,7 +146,8 @@ sudo 模式的挂载点和选项：
   状态栏提示 `Press f again to force-unmount <name> (lazy unmount may lose data)`，
   此时不会执行任何命令；
 - 同一设备再按一次 `f` 才真正执行；中途移动选择、翻页、折叠、`m` / `u` / `Enter`
-  或 `r` 刷新都会取消这次确认，提示也随之消失；
+  或 `r` 刷新都会取消这次确认，提示也随之消失；自动刷新若把该设备刷掉（拔出），
+  确认同样失效并回落 `Ready`，不会把提示指向别的设备；
 - 前置检查不通过时第一次即拒绝，不会进入等待确认状态；
 - 实际命令随模式不同：默认模式 `udisksctl unmount -b <dev> -f`（不需要 sudo，界面
   不中断），sudo 模式 `sudo umount -l <dev>`（失败时再对挂载点重试一次）。
@@ -199,9 +200,10 @@ cargo build
 tests/e2e/run-all.sh
 ```
 
-覆盖系统盘保护、多挂载拒绝、USB 挂载真实挂载点、LVM 成员提示、滚动、标签、热插拔
-自动刷新、旧版 `lsblk` 回退、默认模式失败不提权不建目录、sudo 模式的目标/选项/
-失败清理与成功报告。详见 [`tests/e2e/README.md`](tests/e2e/README.md)。
+覆盖系统盘保护、多挂载拒绝、USB 挂载/卸载、LVM 成员提示、滚动、标签、热插拔
+自动刷新、旧版 `lsblk` 回退、默认模式失败不提权不建目录、默认模式强制卸载
+（二次确认 → `udisksctl unmount -f`）、sudo 模式的目标/选项/失败清理、卸载、
+再次挂载与强制卸载成功报告。详见 [`tests/e2e/README.md`](tests/e2e/README.md)。
 
 ## 已知限制
 

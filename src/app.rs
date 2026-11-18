@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ratatui::widgets::ListState;
 
@@ -665,10 +665,28 @@ impl App {
     }
 
     /// Replace the device tree while keeping the selection on the same device.
+    ///
+    /// A pending force-unmount confirmation only applies to the device it was
+    /// armed on: when a refresh makes the selection point at a different device
+    /// (usually because the armed one disappeared), the confirmation is dropped
+    /// and the prompt falls back to `Ready`.
     pub fn set_devices(&mut self, devices: Vec<BlockDevice>) {
         let previous = self.selected_device().map(|device| device.name);
         self.devices = devices;
         self.restore_selection(previous);
+        self.drop_orphaned_force_confirm();
+    }
+
+    /// Drop a pending force confirmation that no longer belongs to the selected
+    /// device.
+    fn drop_orphaned_force_confirm(&mut self) {
+        let Some(pending) = self.force_confirm.clone() else {
+            return;
+        };
+        let selected = self.selected_device().map(|device| device.name);
+        if selected.as_deref() != Some(pending.as_str()) {
+            self.clear_force_confirm();
+        }
     }
 
     fn restore_selection(&mut self, previous_name: Option<String>) {
@@ -705,14 +723,28 @@ fn force_confirm_prompt(device_name: &str) -> String {
 
 /// Extract the mount point from `udisksctl mount` output:
 /// `Mounted /dev/sdb1 at /media/user/USB.`
+///
+/// The split happens on the *first* ` at `: the device part never contains one,
+/// while the mount point may (`/media/user/My at Disk`). The sentence period is
+/// only removed when the dot-terminated path does not exist, so a directory
+/// whose name really ends in `.` keeps its name.
 fn parse_udisks_mountpoint(stdout: &str) -> Option<String> {
-    let line = stdout.trim().trim_end_matches('.');
+    let line = stdout.trim();
     let (_, mount_point) = line.split_once(" at ")?;
     let mount_point = mount_point.trim();
+    let mount_point = strip_sentence_period(mount_point);
     if mount_point.is_empty() {
         None
     } else {
         Some(mount_point.to_string())
+    }
+}
+
+/// Drop the trailing `.` udisksctl appends, unless it is part of a real path.
+fn strip_sentence_period(candidate: &str) -> &str {
+    match candidate.strip_suffix('.') {
+        Some(stripped) if !stripped.is_empty() && !Path::new(candidate).exists() => stripped,
+        _ => candidate,
     }
 }
 
@@ -773,7 +805,6 @@ fn outcome_status(
 mod tests {
     use super::*;
     use crate::runner::fake::FakeRunner;
-    use std::path::Path;
 
     fn bd(name: &str, device_type: &str, fstype: Option<&str>, mp: Option<&str>) -> BlockDevice {
         BlockDevice {
@@ -1354,6 +1385,51 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_that_keeps_the_armed_device_keeps_the_prompt() {
+        let mut app = forceable_app();
+        app.force_unmount_selected(&no_commands());
+        assert_eq!(app.force_confirm.as_deref(), Some("sdb1"));
+
+        // Auto-refresh replaced the tree (same device, different details).
+        let mut refreshed = with_mounts(bd("sdb1", "part", Some("vfat"), None), &["/mnt/data"]);
+        refreshed.label = Some("USBKEY".to_string());
+        app.set_devices(vec![refreshed]);
+
+        assert_eq!(app.force_confirm.as_deref(), Some("sdb1"));
+        assert!(force_prompt_shown(&app));
+    }
+
+    #[test]
+    fn a_refresh_that_drops_the_armed_device_clears_the_prompt() {
+        let mut app = forceable_app();
+        app.force_unmount_selected(&no_commands());
+        assert_eq!(app.force_confirm.as_deref(), Some("sdb1"));
+        assert!(force_prompt_shown(&app));
+
+        // The armed device disappeared (unplugged between two refreshes): the
+        // pending confirmation no longer applies to the selected device, so it
+        // is dropped and the status bar falls back to `Ready`.
+        app.set_devices(vec![bd("sda", "disk", None, None)]);
+        assert_eq!(app.force_confirm, None);
+        assert_eq!(
+            app.action,
+            ActionStatus::None,
+            "a stale prompt must not linger in the status bar"
+        );
+        assert_eq!(app.selected_device().unwrap().name, "sda");
+    }
+
+    #[test]
+    fn an_empty_tree_after_a_refresh_clears_the_prompt() {
+        let mut app = forceable_app();
+        app.force_unmount_selected(&no_commands());
+        app.set_devices(Vec::new());
+        assert_eq!(app.force_confirm, None);
+        assert!(app.selected_device().is_none());
+        assert_eq!(app.action, ActionStatus::None);
+    }
+
+    #[test]
     fn sudo_mount_uses_the_configured_root_and_owner_options() {
         with_temp_home(|home| {
             let root = TempDir::new("sudo-root");
@@ -1570,6 +1646,37 @@ mod tests {
             Some("/media/user/My Disk".to_string())
         );
         assert_eq!(parse_udisks_mountpoint("something else"), None);
+    }
+
+    #[test]
+    fn a_mountpoint_containing_the_separator_is_parsed_whole() {
+        assert_eq!(
+            parse_udisks_mountpoint("Mounted /dev/sdb1 at /media/user/My at Disk."),
+            Some("/media/user/My at Disk".to_string())
+        );
+        assert_eq!(
+            parse_udisks_mountpoint("Mounted /dev/sdb1 at /media/user/a at b at c"),
+            Some("/media/user/a at b at c".to_string())
+        );
+    }
+
+    #[test]
+    fn a_mountpoint_ending_in_a_dot_keeps_it_when_the_path_exists() {
+        let root = TempDir::new("dot");
+        let dir = root.path().join("USB.");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Without the sentence period the dot is part of the real path.
+        assert_eq!(
+            parse_udisks_mountpoint(&format!("Mounted /dev/sdb1 at {}", dir.display())),
+            Some(dir.display().to_string())
+        );
+        // With the period the candidate does not exist, so only that one is
+        // dropped and the real directory is reported.
+        assert_eq!(
+            parse_udisks_mountpoint(&format!("Mounted /dev/sdb1 at {}.", dir.display())),
+            Some(dir.display().to_string())
+        );
     }
 
     #[test]

@@ -4,7 +4,11 @@
 # The safety scenarios assert that this file is never reached; the sudo-mode
 # scenarios assert that it is. `$MOCK_STATE/sudo_ok` makes a `mount` succeed:
 # the mount point (last argument) is recorded in `$MOCK_STATE/sdz1_mp` so the
-# lsblk mock can report the device as mounted there. `umount` always fails.
+# lsblk mock can report the device as mounted there.
+#
+# `$MOCK_STATE/sudo_umount_ok` makes `umount` (also `umount -l`) succeed: the
+# recorded mount point is removed again, so the next lsblk report shows the
+# device as unmounted. Without the flag `umount` fails like every other call.
 set -u
 
 if [ -z "${MOCK_STATE:-}" ]; then
@@ -21,6 +25,12 @@ if [ "${1:-}" = "mount" ] && [ -f "$MOCK_STATE/sudo_ok" ]; then
     done
     printf '%s\n' "$target" >"$MOCK_STATE/sdz1_mp"
     echo "MOCK SUDO: mounted $target"
+    exit 0
+fi
+
+if [ "${1:-}" = "umount" ] && [ -f "$MOCK_STATE/sudo_umount_ok" ]; then
+    rm -f "$MOCK_STATE/sdz1_mp"
+    echo "MOCK SUDO: unmounted"
     exit 0
 fi
 
