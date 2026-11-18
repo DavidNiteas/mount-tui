@@ -11,8 +11,9 @@
 | `run_udisks_fail.sh` | 默认模式（udisksctl）失败：状态栏报错、CJK 长错误尾部 `END_OF_LONG_ERROR` 不被裁剪、界面不中断、**无 `sudo` 调用**、**不创建 `$HOME/mnt`** | 9 |
 | `run_sudo.sh` | `MOUNT_TUI_MODE=sudo`：目标在配置的根下、`sudo mount -o nosuid,nodev` 参数正确、执行前创建目标目录、失败后不残留空目录、成功时报告真实挂载点、`sudo umount` 成功、再次挂载、`f`×2 → `sudo umount -l` 且挂载点消失 | 23 |
 | `run_force.sh` | 默认模式强制卸载：`m` 挂载 → 第一次 `f` 只提示且不执行命令 → 第二次 `f` 执行 `udisksctl unmount -b /dev/sdb1 -f`，状态栏报成功、设备回到未挂载、**无 `sudo` 调用** | 10 |
+| `run_search.sh` | loop 过滤（默认隐藏 → `l` 显示 → `l` 再隐藏）、实时搜索（`/` 输入、边打边过滤、Enter 保留、Esc 清除）、无匹配空列表、`[`/`]` 详情滚动 | 19 |
 
-合计 89 项断言；`run-all.sh` 聚合六个场景，全部 PASS 才 `exit 0`。
+合计 108 项断言；`run-all.sh` 聚合七个场景，全部 PASS 才 `exit 0`。
 
 ## 依赖
 
@@ -50,6 +51,8 @@ MOUNT_TUI_BIN=target/release/mount-tui tests/e2e/run-all.sh
   调用者继承的 `XDG_CONFIG_HOME` 与这两个变量，避免读到真实配置。
 - **系统命令全部 stub**：`lsblk`、`udisksctl`、`sudo`、`fuser`、`lsof` 都来自
   `mock/bin`（旧列场景额外前置 `mock_legacy/bin`），mock 之外的命令不会被调用。
+  mock 的设备树里固定带一个 `loop0`（默认被 TUI 隐藏，`l` 才显示），供 loop 过滤
+  与搜索场景使用。
   `mock sudo` 默认失败；sudo 场景用 `$MOCK_STATE/sudo_ok` 让它挂载成功并把挂载点写进
   `$MOCK_STATE/sdz1_mp`，由 `lsblk` mock 回读成 sdz1 的挂载点；`$MOCK_STATE/sudo_umount_ok`
   让 `umount`（含 `umount -l`）成功并删除该挂载点记录。

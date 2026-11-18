@@ -125,20 +125,55 @@ fn status_bar_height(message: &str, width: u16) -> u16 {
     (u16::try_from(rows).unwrap_or(u16::MAX).saturating_add(2)).clamp(3, 8)
 }
 
+/// Rows of the help bar (borders + two text lines).
+const HELP_HEIGHT: u16 = 4;
+
+/// Terminal height from which the help bar is shown at all.
+const HELP_MIN_TERMINAL_HEIGHT: u16 = 14;
+
+/// Rows the list / details panes always keep, the status bar is capped below.
+const CONTENT_MIN_HEIGHT: u16 = 6;
+
+/// Smallest possible status bar: two borders plus one text line.
+const STATUS_MIN_HEIGHT: u16 = 3;
+
+/// Help bar height for a terminal `terminal_height` rows tall.
+///
+/// On a short terminal the device list is more valuable than the key hints, so
+/// the bar disappears entirely (0) instead of squeezing the content area.
+fn help_height(terminal_height: u16) -> u16 {
+    if terminal_height >= HELP_MIN_TERMINAL_HEIGHT {
+        HELP_HEIGHT
+    } else {
+        0
+    }
+}
+
+/// Final status bar height: the measured text height, capped so that the title
+/// (1 row), the help bar and a [`CONTENT_MIN_HEIGHT`] row content area always
+/// fit into `terminal_height`. Never below [`STATUS_MIN_HEIGHT`].
+fn status_height(measured: u16, terminal_height: u16) -> u16 {
+    let available =
+        terminal_height.saturating_sub(1 + help_height(terminal_height) + CONTENT_MIN_HEIGHT);
+    measured.min(available).max(STATUS_MIN_HEIGHT)
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let (status_message, _) = status_content(&app.action);
     // A border on each side leaves `width - 2` text columns.
-    let status_height = status_bar_height(&status_message, area.width.saturating_sub(2));
+    let measured_status = status_bar_height(&status_message, area.width.saturating_sub(2));
+    let status_rows = status_height(measured_status, area.height);
+    let help_rows = help_height(area.height);
 
     // Main layout: title | content | status | help
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),             // title
-            Constraint::Min(0),                // content
-            Constraint::Length(status_height), // action status (dynamic)
-            Constraint::Length(4),             // help bar (2 text rows + borders)
+            Constraint::Length(1),           // title
+            Constraint::Min(0),              // content
+            Constraint::Length(status_rows), // action status (dynamic)
+            Constraint::Length(help_rows),   // help bar (hidden on short terminals)
         ])
         .split(area);
 
@@ -163,8 +198,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Action status bar
     render_action_status(frame, app, main_layout[2]);
 
-    // Help bar
-    render_help(frame, main_layout[3]);
+    // Help bar (absent on short terminals, the layout gives it no rows then)
+    if help_rows > 0 {
+        render_help(frame, app, main_layout[3]);
+    }
 }
 
 fn render_device_list(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -181,11 +218,15 @@ fn render_device_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .flat_items()
         .into_iter()
         .map(|item| {
+            // A search query expands every branch so matches are visible; the
+            // marker follows what is actually on screen, not the collapse
+            // state that only applies to the unfiltered tree.
+            let shows_children = !app.is_collapsed(&item.device.name) || app.filter_active();
             let prefix = if App::has_children(&item.device) {
-                if app.is_collapsed(&item.device.name) {
-                    " [>] "
-                } else {
+                if shows_children {
                     " [v] "
+                } else {
+                    " [>] "
                 }
             } else {
                 "     "
@@ -322,7 +363,10 @@ fn render_device_details(frame: &mut Frame, app: &App, area: Rect) {
 
     let paragraph = Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: false })
-        .style(normal_style());
+        .style(normal_style())
+        // `[` / `]` scroll the rendered details; long values wrap instead of
+        // being cut, so scrolling reaches every row.
+        .scroll((app.details_scroll, 0));
 
     frame.render_widget(paragraph, inner);
 }
@@ -344,15 +388,37 @@ fn render_action_status(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(text, inner);
 }
 
-fn render_help(frame: &mut Frame, area: Rect) {
+fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     let key = |label: &'static str| Span::styled(label, Style::new().fg(Color::Yellow));
-    let help_text = Text::from(vec![
-        Line::from(vec![
-            key(" <Up/Down PgUp/PgDn Home/End> "),
+    let hint = |text: &'static str| Span::styled(text, Style::new().fg(Color::DarkGray));
+
+    // First line: what the list / search line is doing right now.
+    let first_line = if app.search_editing {
+        vec![
+            Span::styled(" Search: ", Style::new().fg(Color::Yellow)),
+            Span::raw(app.search.clone()),
+        ]
+    } else if app.search.is_empty() {
+        vec![
+            key(" <Up/Down PgUp/PgDn> "),
             Span::raw("Navigate  "),
             key(" <Left/Right> "),
-            Span::raw("Collapse"),
-        ]),
+            Span::raw("Collapse  "),
+            key(" / "),
+            Span::raw("Search  "),
+            key(" l "),
+            Span::raw("Loops"),
+        ]
+    } else {
+        vec![
+            Span::styled(" Filter: ", Style::new().fg(Color::Yellow)),
+            Span::raw(app.search.clone()),
+            hint(" (/ edit, Esc clear)"),
+        ]
+    };
+
+    let help_text = Text::from(vec![
+        Line::from(first_line),
         Line::from(vec![
             key(" m "),
             Span::raw("Mount  "),
@@ -360,6 +426,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
             Span::raw("Unmount  "),
             Span::styled(" f ", Style::new().fg(Color::Red)),
             Span::raw("Force unmount  "),
+            key(" [ ] "),
+            Span::raw("Details  "),
             key(" r "),
             Span::raw("Refresh  "),
             key(" q "),
@@ -475,6 +543,31 @@ mod tests {
         // height then saturates at the 8 row cap (a fixed 8 row scratch window
         // would have seen only the first line and returned 3).
         assert_eq!(status_bar_height("a\n\n\n\n\n\n\n\n\n\nEND", 40), 8);
+    }
+
+    #[test]
+    fn help_bar_is_hidden_on_short_terminals() {
+        assert_eq!(help_height(1), 0);
+        assert_eq!(help_height(13), 0);
+        assert_eq!(help_height(14), 4);
+        assert_eq!(help_height(40), 4);
+    }
+
+    #[test]
+    fn status_height_reserves_a_six_row_content_area() {
+        // Tall terminal: the measured height is used as is (up to its own cap).
+        assert_eq!(status_height(3, 40), 3);
+        assert_eq!(status_height(8, 40), 8);
+
+        // 14 rows: 14 - 1 title - 4 help - 6 content = 3 rows for the status.
+        assert_eq!(status_height(8, 14), 3);
+        // 13 rows: no help bar, so 13 - 1 - 6 = 6 rows remain.
+        assert_eq!(status_height(8, 13), 6);
+        assert_eq!(status_height(3, 13), 3);
+
+        // A tiny terminal cannot fit the content area: keep the minimum status.
+        assert_eq!(status_height(8, 6), 3);
+        assert_eq!(status_height(8, 0), 3);
     }
 
     #[test]

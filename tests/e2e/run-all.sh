@@ -20,7 +20,7 @@ if [ ! -x "$BIN" ]; then
 fi
 
 fail=0
-for scenario in run_main.sh run_hotplug.sh run_legacy.sh run_udisks_fail.sh run_sudo.sh run_force.sh; do
+for scenario in run_main.sh run_hotplug.sh run_legacy.sh run_udisks_fail.sh run_sudo.sh run_force.sh run_search.sh; do
     echo "=== ${scenario%.sh} ==="
     if ! bash "$E2E_DIR/$scenario"; then
         fail=1

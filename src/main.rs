@@ -240,13 +240,51 @@ fn handle_key(
     key: KeyEvent,
     runner: &dyn runner::CommandRunner,
 ) -> Option<InteractiveRequest> {
+    // The search input line owns the keyboard: typed characters belong to the
+    // query (`q` included) and no global shortcut fires. Only Ctrl-C still
+    // quits, so a lost input line can never trap the user.
+    if app.search_editing {
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.running = false;
+            }
+            KeyCode::Enter => app.confirm_search(),
+            KeyCode::Esc => app.cancel_search(),
+            KeyCode::Backspace => app.search_backspace(),
+            KeyCode::Char(character) => app.search_push_char(character),
+            _ => {}
+        }
+        return None;
+    }
+
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.running = false;
             None
         }
-        KeyCode::Char('q') | KeyCode::Esc => {
+        KeyCode::Char('q') => {
             app.running = false;
+            None
+        }
+        KeyCode::Esc => {
+            // An applied filter is cleared first: Esc only quits the list view.
+            if app.search.is_empty() {
+                app.running = false;
+            } else {
+                app.clear_search();
+            }
+            None
+        }
+        KeyCode::Char('/') => {
+            app.begin_search();
+            None
+        }
+        KeyCode::Char('[') => {
+            app.scroll_details_up();
+            None
+        }
+        KeyCode::Char(']') => {
+            app.scroll_details_down();
             None
         }
         KeyCode::Up => {
@@ -284,6 +322,10 @@ fn handle_key(
             'f' => app.force_unmount_selected(runner),
             'r' => {
                 app.refresh(runner);
+                None
+            }
+            'l' => {
+                app.toggle_loops();
                 None
             }
             _ => None,

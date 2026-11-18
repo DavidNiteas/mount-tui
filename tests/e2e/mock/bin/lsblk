@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Mock `lsblk` for tests/e2e (new-style output, includes MOUNTPOINTS).
 #
+# The tree always carries a `loop0` device (hidden by the TUI unless `l` is
+# pressed) so the loop filter / search scenario has something to reveal.
+#
 # State (read from $MOCK_STATE, never from the repository):
 #   $MOCK_STATE/mounted  -> sdb1 is mounted at /media/e2e/USBKEY
 #   $MOCK_STATE/hotplug  -> an extra "sdhot" disk is plugged in
@@ -29,6 +32,7 @@ fi
 json+='{"name":"sda","size":"100G","type":"disk","fstype":null,"mountpoints":[null],"label":null,"model":"SYSDISK","vendor":"V","tran":"sata","serial":"S1","uuid":null,"ro":false,"rm":false,"children":['
 json+='{"name":"sda1","size":"100G","type":"part","fstype":"ext4","mountpoints":["/home"],"label":null,"model":null,"vendor":null,"tran":null,"serial":null,"uuid":"U1","ro":false,"rm":false}'
 json+=']},'
+json+='{"name":"loop0","size":"128M","type":"loop","fstype":"squashfs","mountpoints":["/snap/core/1"],"label":"LOOPVOL","model":null,"vendor":null,"tran":null,"serial":null,"uuid":null,"ro":true,"rm":false},'
 json+='{"name":"sdb","size":"8G","type":"disk","fstype":null,"mountpoints":[null],"label":null,"model":"USBSTICK","vendor":"Generic","tran":"usb","serial":"S2","uuid":null,"ro":false,"rm":true,"children":['
 json+="{\"name\":\"sdb1\",\"size\":\"8G\",\"type\":\"part\",\"fstype\":\"vfat\",\"mountpoints\":[$mp],\"label\":\"USBKEY\",\"model\":null,\"vendor\":null,\"tran\":null,\"serial\":null,\"uuid\":\"ABCD-1234\",\"ro\":false,\"rm\":true}"
 json+=']},'

@@ -11,6 +11,12 @@ use crate::runner::{CommandRunner, CommandSpec};
 /// Number of rows jumped by PageUp / PageDown.
 const PAGE_STEP: usize = 10;
 
+/// Maximum number of rows the details pane can be scrolled down (`]`).
+const DETAILS_SCROLL_MAX: u16 = 100;
+
+/// `lsblk` device type of loop devices (snap images, mounted ISO files, ...).
+const LOOP_DEVICE_TYPE: &str = "loop";
+
 /// Prefix of the status line asking for the second `f` press. [`App::clear_force_confirm`]
 /// uses it to remove the prompt again when the pending confirmation is dropped.
 const FORCE_CONFIRM_PROMPT: &str = "Press f again to force-unmount";
@@ -71,6 +77,15 @@ pub struct App {
     /// Device with an armed force-unmount confirmation: the first `f` arms it,
     /// the second `f` on the same device actually runs the command.
     pub force_confirm: Option<String>,
+    /// Hide `loop` devices (snap images, ...) in the list; `l` toggles it.
+    pub hide_loops: bool,
+    /// Search query (already applied while typing); empty means "no filter".
+    pub search: String,
+    /// `true` while the `/` input line has the keyboard: every printable key
+    /// belongs to the query, global shortcuts are suspended.
+    pub search_editing: bool,
+    /// First details row shown by the details pane (`[` / `]`).
+    pub details_scroll: u16,
     pub running: bool,
 }
 
@@ -92,6 +107,10 @@ impl App {
             list_state: ListState::default(),
             action: ActionStatus::None,
             force_confirm: None,
+            hide_loops: true,
+            search: String::new(),
+            search_editing: false,
+            details_scroll: 0,
             running: true,
         };
         app.clamp_selection();
@@ -100,30 +119,125 @@ impl App {
 
     /// Build a flat list for display: every device recursively, children only
     /// when their parent is expanded.
+    ///
+    /// Two view filters are applied on the way down:
+    ///
+    /// * loop devices are dropped when [`App::hide_loops`] is set (with their
+    ///   whole subtree, a loop device cannot be mounted/unmounted here);
+    /// * a non-empty search query keeps only the matching devices, the branches
+    ///   leading to them and (for a matching device) its whole subtree. While a
+    ///   query is active the collapse state is ignored so matches are visible.
     pub fn flat_items(&self) -> Vec<DeviceItem> {
+        let query = self.search_query();
         let mut items = Vec::new();
         for device in &self.devices {
-            Self::push_items(&mut items, device, 0, &self.collapsed);
+            Self::collect_items(
+                &mut items,
+                device,
+                0,
+                &self.collapsed,
+                self.hide_loops,
+                query.as_deref(),
+            );
         }
         items
     }
 
-    fn push_items(
+    /// Normalised search query: `None` when nothing has to be filtered.
+    ///
+    /// Surrounding whitespace is ignored (a query of blanks is "no filter"), and
+    /// matching is case-insensitive, so the query is lowercased once here.
+    fn search_query(&self) -> Option<String> {
+        let query = self.search.trim();
+        if query.is_empty() {
+            None
+        } else {
+            Some(query.to_lowercase())
+        }
+    }
+
+    /// `true` when a search query filters the list.
+    pub fn filter_active(&self) -> bool {
+        self.search_query().is_some()
+    }
+
+    fn collect_items(
         items: &mut Vec<DeviceItem>,
         device: &BlockDevice,
         depth: usize,
         collapsed: &HashSet<String>,
+        hide_loops: bool,
+        query: Option<&str>,
     ) {
+        if hide_loops && is_loop(device) {
+            return;
+        }
+
+        let Some(query) = query else {
+            // No query: the plain tree, respecting the collapse state.
+            items.push(DeviceItem {
+                device: device.clone(),
+                depth,
+            });
+            if collapsed.contains(&device.name) {
+                return;
+            }
+            if let Some(children) = &device.children {
+                for child in children {
+                    Self::collect_items(items, child, depth + 1, collapsed, hide_loops, None);
+                }
+            }
+            return;
+        };
+
+        // A matching device is kept together with everything below it.
+        if device_matches_query(device, query) {
+            Self::push_subtree(items, device, depth, hide_loops);
+            return;
+        }
+
+        // Only descendants match: this device stays as their branch. Siblings
+        // without a match are dropped, an unmatched leaf disappears entirely.
+        let mut descendants = Vec::new();
+        if let Some(children) = &device.children {
+            for child in children {
+                Self::collect_items(
+                    &mut descendants,
+                    child,
+                    depth + 1,
+                    collapsed,
+                    hide_loops,
+                    Some(query),
+                );
+            }
+        }
+        if descendants.is_empty() {
+            return;
+        }
         items.push(DeviceItem {
             device: device.clone(),
             depth,
         });
-        if collapsed.contains(&device.name) {
+        items.extend(descendants);
+    }
+
+    /// Push a device and its whole subtree (loop devices still filtered).
+    fn push_subtree(
+        items: &mut Vec<DeviceItem>,
+        device: &BlockDevice,
+        depth: usize,
+        hide_loops: bool,
+    ) {
+        if hide_loops && is_loop(device) {
             return;
         }
+        items.push(DeviceItem {
+            device: device.clone(),
+            depth,
+        });
         if let Some(children) = &device.children {
             for child in children {
-                Self::push_items(items, child, depth + 1, collapsed);
+                Self::push_subtree(items, child, depth + 1, hide_loops);
             }
         }
     }
@@ -153,6 +267,7 @@ impl App {
 
     pub fn navigate_up(&mut self) {
         self.clear_force_confirm();
+        self.details_scroll = 0;
         let index = self.list_state.selected().unwrap_or(0).saturating_sub(1);
         if !self.flat_items().is_empty() {
             self.list_state.select(Some(index));
@@ -161,6 +276,7 @@ impl App {
 
     pub fn navigate_down(&mut self) {
         self.clear_force_confirm();
+        self.details_scroll = 0;
         let len = self.flat_items().len();
         if len == 0 {
             return;
@@ -171,6 +287,7 @@ impl App {
 
     pub fn select_first(&mut self) {
         self.clear_force_confirm();
+        self.details_scroll = 0;
         if !self.flat_items().is_empty() {
             self.list_state.select(Some(0));
         }
@@ -178,6 +295,7 @@ impl App {
 
     pub fn select_last(&mut self) {
         self.clear_force_confirm();
+        self.details_scroll = 0;
         let len = self.flat_items().len();
         if len > 0 {
             self.list_state.select(Some(len - 1));
@@ -186,6 +304,7 @@ impl App {
 
     pub fn page_up(&mut self) {
         self.clear_force_confirm();
+        self.details_scroll = 0;
         if self.flat_items().is_empty() {
             return;
         }
@@ -199,6 +318,7 @@ impl App {
 
     pub fn page_down(&mut self) {
         self.clear_force_confirm();
+        self.details_scroll = 0;
         let len = self.flat_items().len();
         if len == 0 {
             return;
@@ -220,6 +340,81 @@ impl App {
             self.collapsed.insert(item.device.name);
         }
         self.clamp_selection();
+    }
+
+    /// `/`: start a new search. A previous query is dropped so the input line
+    /// always starts empty.
+    pub fn begin_search(&mut self) {
+        self.search.clear();
+        self.search_editing = true;
+        self.view_changed();
+    }
+
+    /// Append a typed character to the query (the list filters live).
+    pub fn search_push_char(&mut self, c: char) {
+        self.search.push(c);
+        self.view_changed();
+    }
+
+    /// Backspace in the search input.
+    pub fn search_backspace(&mut self) {
+        if self.search.pop().is_some() {
+            self.view_changed();
+        }
+    }
+
+    /// Enter: leave the input line, keep the query applied.
+    pub fn confirm_search(&mut self) {
+        self.search_editing = false;
+    }
+
+    /// Esc in the input line: drop the query and leave the input line.
+    pub fn cancel_search(&mut self) {
+        self.search.clear();
+        self.search_editing = false;
+        self.view_changed();
+    }
+
+    /// Esc outside the input line: drop an applied query, return to the tree.
+    pub fn clear_search(&mut self) {
+        self.search.clear();
+        self.view_changed();
+    }
+
+    /// `l`: show / hide loop devices, reporting the new state in the status bar.
+    pub fn toggle_loops(&mut self) {
+        self.hide_loops = !self.hide_loops;
+        self.view_changed();
+        self.action = ActionStatus::Success(
+            if self.hide_loops {
+                "Loop devices hidden"
+            } else {
+                "Loop devices shown"
+            }
+            .into(),
+        );
+    }
+
+    /// `[`: scroll the details pane one row up.
+    pub fn scroll_details_up(&mut self) {
+        self.details_scroll = self.details_scroll.saturating_sub(1);
+    }
+
+    /// `]`: scroll the details pane one row down (bounded by
+    /// [`DETAILS_SCROLL_MAX`]).
+    pub fn scroll_details_down(&mut self) {
+        self.details_scroll = self
+            .details_scroll
+            .saturating_add(1)
+            .min(DETAILS_SCROLL_MAX);
+    }
+
+    /// The visible list changed (query / loop filter): keep the selection inside
+    /// it and drop state that belongs to the previous view.
+    fn view_changed(&mut self) {
+        self.clamp_selection();
+        self.clear_force_confirm();
+        self.details_scroll = 0;
     }
 
     /// Find a device by name at any depth of the tree.
@@ -673,7 +868,12 @@ impl App {
     pub fn set_devices(&mut self, devices: Vec<BlockDevice>) {
         let previous = self.selected_device().map(|device| device.name);
         self.devices = devices;
-        self.restore_selection(previous);
+        self.restore_selection(previous.clone());
+        // The details pane only scrolls when the selection moves to another
+        // device: a refresh that keeps the selection keeps the scroll offset.
+        if self.selected_device().map(|device| device.name) != previous {
+            self.details_scroll = 0;
+        }
         self.drop_orphaned_force_confirm();
     }
 
@@ -711,6 +911,36 @@ impl App {
         let index = self.list_state.selected().unwrap_or(0).min(len - 1);
         self.list_state.select(Some(index));
     }
+}
+
+/// `true` when `lsblk` reports the device as a loop device.
+fn is_loop(device: &BlockDevice) -> bool {
+    device.device_type.eq_ignore_ascii_case(LOOP_DEVICE_TYPE)
+}
+
+/// `true` when any searchable field of `device` contains `query`.
+///
+/// `query` is already lowercased (see [`App::search_query`]); name, label,
+/// model, fstype and every mount point are compared case-insensitively. Vendor,
+/// serial and UUID are deliberately not searchable.
+fn device_matches_query(device: &BlockDevice, query: &str) -> bool {
+    let fields = [
+        Some(device.name.as_str()),
+        device.label.as_deref(),
+        device.model.as_deref(),
+        device.fstype.as_deref(),
+    ];
+    if fields
+        .iter()
+        .flatten()
+        .any(|field| field.to_lowercase().contains(query))
+    {
+        return true;
+    }
+    device
+        .mountpoints
+        .iter()
+        .any(|mountpoint| mountpoint.to_lowercase().contains(query))
 }
 
 /// Status text of the first `f` press, before the force unmount is issued.
@@ -2000,6 +2230,307 @@ mod tests {
             ActionStatus::Success("Mounted /dev/sdb1 at /media/u/USB".into())
         );
         assert_eq!(runner.call_count(), 1);
+    }
+
+    // --- B2: loop filter, search, details scroll -----------------------------
+
+    /// A loop device as `lsblk` reports it (snap image / mounted ISO).
+    fn loop_device(name: &str) -> BlockDevice {
+        let mut device = bd(name, "loop", Some("squashfs"), None);
+        device.ro = true;
+        device
+    }
+
+    /// Every searchable field is carried by exactly one device here.
+    ///
+    /// `sda` (model SYSDISK) → `sda1` (ext4, /boot);
+    /// `sdb` (model USBSTICK) → `sdb1` (label USBKEY, vfat, /media/u/USBKEY)
+    /// → `sdb1-crypt` (crypt, ext4).
+    fn search_tree() -> Vec<BlockDevice> {
+        let mut system = bd("sda", "disk", None, None);
+        system.model = Some("SYSDISK".into());
+        let mut usb = bd("sdb", "disk", None, None);
+        usb.model = Some("USBSTICK".into());
+        let mut partition = bd("sdb1", "part", Some("vfat"), None);
+        partition.label = Some("USBKEY".into());
+        partition.mountpoints = vec!["/media/u/USBKEY".into()];
+        let partition = with_children(
+            partition,
+            vec![bd("sdb1-crypt", "crypt", Some("ext4"), None)],
+        );
+        vec![
+            with_children(
+                system,
+                vec![bd("sda1", "part", Some("ext4"), Some("/boot"))],
+            ),
+            with_children(usb, vec![partition]),
+        ]
+    }
+
+    fn names(app: &App) -> Vec<String> {
+        app.flat_items()
+            .into_iter()
+            .map(|item| item.device.name)
+            .collect()
+    }
+
+    fn depths(app: &App) -> Vec<(String, usize)> {
+        app.flat_items()
+            .into_iter()
+            .map(|item| (item.device.name, item.depth))
+            .collect()
+    }
+
+    /// Type `query` into the search line and apply it, exactly like `/` … Enter.
+    fn search_for(app: &mut App, query: &str) {
+        app.begin_search();
+        for character in query.chars() {
+            app.search_push_char(character);
+        }
+        app.confirm_search();
+    }
+
+    #[test]
+    fn loop_devices_are_hidden_by_default_and_toggle_with_l() {
+        let mut app = app_with(vec![
+            bd("sda", "disk", None, None),
+            loop_device("loop0"),
+            bd("sdb1", "part", Some("vfat"), Some("/mnt/x")),
+        ]);
+        assert!(app.hide_loops);
+        assert_eq!(names(&app), vec!["sda", "sdb1"]);
+
+        app.toggle_loops();
+        assert!(!app.hide_loops);
+        assert_eq!(names(&app), vec!["sda", "loop0", "sdb1"]);
+        assert_eq!(
+            app.action,
+            ActionStatus::Success("Loop devices shown".into())
+        );
+
+        app.toggle_loops();
+        assert!(app.hide_loops);
+        assert_eq!(names(&app), vec!["sda", "sdb1"]);
+        assert_eq!(
+            app.action,
+            ActionStatus::Success("Loop devices hidden".into())
+        );
+    }
+
+    #[test]
+    fn hidden_loop_devices_are_not_searchable_either() {
+        let mut app = app_with(vec![bd("sda", "disk", None, None), loop_device("loop0")]);
+
+        search_for(&mut app, "squashfs");
+        assert!(
+            app.flat_items().is_empty(),
+            "a hidden loop device cannot match"
+        );
+
+        app.toggle_loops();
+        assert_eq!(names(&app), vec!["loop0"]);
+    }
+
+    #[test]
+    fn search_matches_name_label_model_fstype_and_mountpoints() {
+        let cases: [(&str, Vec<&str>); 6] = [
+            // Lowercase query, uppercase label: case-insensitive.
+            ("usbkey", vec!["sdb", "sdb1", "sdb1-crypt"]),
+            ("USBKEY", vec!["sdb", "sdb1", "sdb1-crypt"]),
+            ("usbstick", vec!["sdb", "sdb1", "sdb1-crypt"]),
+            ("vfat", vec!["sdb", "sdb1", "sdb1-crypt"]),
+            ("/media/u", vec!["sdb", "sdb1", "sdb1-crypt"]),
+            ("sda1", vec!["sda", "sda1"]),
+        ];
+
+        for (query, expected) in cases {
+            let mut app = app_with(search_tree());
+            search_for(&mut app, query);
+            assert_eq!(names(&app), expected, "query {:?}", query);
+        }
+    }
+
+    #[test]
+    fn search_keeps_the_whole_subtree_of_a_matching_device() {
+        let mut app = app_with(search_tree());
+        // The model belongs to the disk itself: everything below it stays.
+        search_for(&mut app, "SYSDISK");
+        assert_eq!(names(&app), vec!["sda", "sda1"]);
+
+        // `sdb1-crypt` is not matched by the query but is a descendant of the
+        // matching `sdb1` (label USBKEY), so it is kept.
+        search_for(&mut app, "usbkey");
+        assert_eq!(names(&app), vec!["sdb", "sdb1", "sdb1-crypt"]);
+        assert_eq!(
+            depths(&app),
+            vec![
+                ("sdb".to_string(), 0),
+                ("sdb1".to_string(), 1),
+                ("sdb1-crypt".to_string(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn search_keeps_the_ancestors_of_a_matching_descendant() {
+        let mut app = app_with(search_tree());
+        search_for(&mut app, "crypt");
+
+        // Only the branch leading to the match is kept, the depths survive.
+        assert_eq!(
+            depths(&app),
+            vec![
+                ("sdb".to_string(), 0),
+                ("sdb1".to_string(), 1),
+                ("sdb1-crypt".to_string(), 2),
+            ]
+        );
+        assert!(!names(&app).contains(&"sda".to_string()));
+    }
+
+    #[test]
+    fn search_ignores_the_collapsed_state() {
+        let mut app = app_with(search_tree());
+        app.list_state.select(Some(2)); // sdb
+        app.toggle_collapse();
+        assert!(app.is_collapsed("sdb"));
+        assert_eq!(names(&app), vec!["sda", "sda1", "sdb"]);
+
+        search_for(&mut app, "usbkey");
+        assert_eq!(names(&app), vec!["sdb", "sdb1", "sdb1-crypt"]);
+
+        // Clearing the query brings the collapsed tree back.
+        app.clear_search();
+        assert_eq!(names(&app), vec!["sda", "sda1", "sdb"]);
+    }
+
+    #[test]
+    fn search_without_matches_empties_the_list_and_the_selection() {
+        let mut app = app_with(search_tree());
+        search_for(&mut app, "no-such-device");
+
+        assert!(app.flat_items().is_empty());
+        assert_eq!(app.list_state.selected(), None);
+        assert!(app.selected_device().is_none());
+    }
+
+    #[test]
+    fn search_clamps_the_selection_into_the_filtered_list() {
+        let mut app = app_with(search_tree());
+        app.list_state.select(Some(4)); // sdb1-crypt, the last row
+
+        search_for(&mut app, "sda");
+        assert_eq!(names(&app), vec!["sda", "sda1"]);
+        assert_eq!(app.list_state.selected(), Some(1));
+        assert_eq!(app.selected_device().unwrap().name, "sda1");
+    }
+
+    #[test]
+    fn search_input_methods_build_and_drop_the_query() {
+        let mut app = app_with(sample_tree());
+        app.search = "stale".into();
+
+        // `/` starts empty, even with an old query around.
+        app.begin_search();
+        assert_eq!(app.search, "");
+        assert!(app.search_editing);
+
+        for character in "sdb".chars() {
+            app.search_push_char(character);
+        }
+        assert_eq!(app.search, "sdb");
+
+        app.search_backspace();
+        assert_eq!(app.search, "sd");
+
+        // Backspace on an empty query is a no-op, not a panic.
+        app.search_backspace();
+        app.search_backspace();
+        app.search_backspace();
+        assert_eq!(app.search, "");
+
+        app.search_push_char('s');
+        app.confirm_search();
+        assert_eq!(app.search, "s");
+        assert!(!app.search_editing, "Enter leaves the input line");
+        assert!(app.filter_active(), "and keeps the query applied");
+
+        // Esc in the input line drops the query…
+        app.begin_search();
+        app.search_push_char('x');
+        app.cancel_search();
+        assert_eq!(app.search, "");
+        assert!(!app.search_editing);
+        assert!(!app.filter_active());
+
+        // …while Esc on the list only drops an applied query.
+        search_for(&mut app, "sda");
+        assert!(app.filter_active());
+        app.clear_search();
+        assert_eq!(app.search, "");
+        assert!(!app.search_editing);
+    }
+
+    #[test]
+    fn search_changes_drop_the_force_confirmation_and_the_details_scroll() {
+        let mut app = forceable_app();
+        app.force_unmount_selected(&no_commands());
+        assert!(app.force_confirm.is_some());
+        app.details_scroll = 7;
+
+        // Typing already re-filters the list: the confirmation and the scroll
+        // offset belong to the previous view.
+        app.begin_search();
+        app.search_push_char('s');
+        assert_eq!(app.force_confirm, None);
+        assert!(!force_prompt_shown(&app));
+        assert_eq!(app.details_scroll, 0);
+
+        // Toggling the loop filter does the same.
+        app.force_unmount_selected(&no_commands());
+        app.details_scroll = 3;
+        app.toggle_loops();
+        assert_eq!(app.force_confirm, None);
+        assert_eq!(app.details_scroll, 0);
+    }
+
+    #[test]
+    fn details_scroll_is_bounded_and_resets_when_the_selection_moves() {
+        let mut app = app_with(sample_tree());
+
+        app.scroll_details_up();
+        assert_eq!(app.details_scroll, 0, "a fresh view cannot scroll up");
+
+        for _ in 0..3 {
+            app.scroll_details_down();
+        }
+        assert_eq!(app.details_scroll, 3);
+        app.scroll_details_up();
+        assert_eq!(app.details_scroll, 2);
+
+        // The cap keeps u16 arithmetic harmless however long a key is held.
+        for _ in 0..200 {
+            app.scroll_details_down();
+        }
+        assert_eq!(app.details_scroll, 100);
+
+        app.navigate_down();
+        assert_eq!(
+            app.details_scroll, 0,
+            "moving the selection resets the scroll"
+        );
+
+        app.details_scroll = 5;
+        app.set_devices(sample_tree());
+        assert_eq!(
+            app.details_scroll, 5,
+            "a refresh that keeps the selection keeps the scroll offset"
+        );
+        app.set_devices(vec![bd("sdc", "disk", None, None)]);
+        assert_eq!(
+            app.details_scroll, 0,
+            "a refresh that moves the selection resets it"
+        );
     }
 
     /// Redirect `HOME` to a scratch directory for the duration of `f`, so the
